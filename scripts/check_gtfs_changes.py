@@ -1,3 +1,6 @@
+"""
+File to check and update the gtfs directory as translink updates the static files every week
+"""
 import hashlib
 import os
 import shutil
@@ -6,18 +9,19 @@ import subprocess
 
 # Directories
 STATIC_GTFS_DIR = "data/gtfs_static/"  # Current GTFS static data
-STATIC_ARCHIVE_DIR = "data/static_archive/"  # Where old GTFS files will be moved
-STATIC_SOURCE_DIR = "data/static/"  # Where new GTFS updates are stored
+STATIC_ARCHIVE_DIR = "data/static_archive/"  #  old GTFS files will be moved
+STATIC_SOURCE_DIR = "data/static/"  #  new GTFS updates are stored
 HASH_FILE = "database/gtfs_hashes.txt"
 PROCESS_SCRIPT = "scripts/process_static.py"
 
+#helpers
 def get_latest_gtfs_folder():
     """Finds the most recent GTFS static folder in 'static/'."""
     subfolders = [f for f in os.listdir(STATIC_SOURCE_DIR) if os.path.isdir(os.path.join(STATIC_SOURCE_DIR, f))]
     if not subfolders:
-        print("❌ No GTFS static folders found in 'static/'.")
+        print("No GTFS static folders found in 'static/'.")
         return None
-    latest_folder = max(subfolders)  # Sorts by date (YYYY-MM-DD format)
+    latest_folder = max(subfolders)  
     return os.path.join(STATIC_SOURCE_DIR, latest_folder)
 
 def hash_file(file_path):
@@ -43,7 +47,6 @@ def check_gtfs_changes():
     if not latest_gtfs_dir:
         return False
 
-    # Compute hashes
     new_hashes = compute_folder_hash(latest_gtfs_dir)
     old_hashes = compute_folder_hash(STATIC_GTFS_DIR)
 
@@ -59,13 +62,13 @@ def check_gtfs_changes():
         move_new_gtfs(latest_gtfs_dir)
         update_hash_file(new_hashes)
 
-        print("🔄 Processing new GTFS static data...")
+        print("Processing new GTFS static data...")
         subprocess.run(["python", PROCESS_SCRIPT])
 
-        return True  # GTFS was updated
+        return True 
 
-    print("✅ No changes detected in GTFS static files.")
-    return False  # No need to reprocess
+    print("No changes detected in GTFS static files.")
+    return False 
 
 def archive_old_gtfs():
     """Move the current GTFS static data to an archive before replacing it."""
@@ -76,23 +79,23 @@ def archive_old_gtfs():
         os.makedirs(STATIC_ARCHIVE_DIR)
 
     shutil.move(STATIC_GTFS_DIR, archive_path)
-    os.makedirs(STATIC_GTFS_DIR)  # Create an empty gtfs_static directory
-    print(f"📂 Archived old GTFS files to {archive_path}")
+    os.makedirs(STATIC_GTFS_DIR)  
+    print(f"Archived old GTFS files to {archive_path}")
 
 def move_new_gtfs(latest_gtfs_dir):
     """Replace old GTFS static files with the newest GTFS static files."""
     for filename in os.listdir(latest_gtfs_dir):
         src_path = os.path.join(latest_gtfs_dir, filename)
         dest_path = os.path.join(STATIC_GTFS_DIR, filename)
-        shutil.copy2(src_path, dest_path)  # Copy new files into gtfs_static
-    print(f"✅ Updated GTFS static with files from {latest_gtfs_dir}")
+        shutil.copy2(src_path, dest_path)  
+    print(f"Updated GTFS static with files from {latest_gtfs_dir}")
 
 def update_hash_file(new_hashes):
     """Update the hash file with the latest GTFS file hashes."""
     with open(HASH_FILE, "w") as f:
         for filename, new_hash in new_hashes.items():
             f.write(f"{filename},{new_hash}\n")
-    print("✅ Hash file updated.")
+    print("Hash file updated.")
 
 if __name__ == "__main__":
     check_gtfs_changes()

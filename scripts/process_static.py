@@ -11,8 +11,8 @@ def get_latest_gtfs_folder():
     """Finds the most recent GTFS static folder in 'data/gtfs_static/'."""
     subfolders = [f for f in os.listdir(STATIC_GTFS_DIR) if os.path.isdir(os.path.join(STATIC_GTFS_DIR, f))]
     if not subfolders:
-        return STATIC_GTFS_DIR  # If no subfolders, use the current directory
-    latest_folder = max(subfolders)  # Sort by date format
+        return STATIC_GTFS_DIR
+    latest_folder = max(subfolders)
     return os.path.join(STATIC_GTFS_DIR, latest_folder)
 
 # Detect latest static GTFS folder
@@ -37,10 +37,10 @@ try:
     trips.to_sql("trips", conn, if_exists="replace", index=False)
 
     conn.commit()
-    print("✅ Static GTFS Data Processed Successfully.")
+    print("Static GTFS Data Processed Successfully.")
     
 except Exception as e:
-    print(f"❌ Error loading GTFS static data: {e}")
+    print(f"Error loading GTFS static data: {e}")
 
 # Close connection
 conn.close()

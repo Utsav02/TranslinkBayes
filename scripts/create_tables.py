@@ -11,7 +11,7 @@ cursor_static = conn_static.cursor()
 conn_realtime = sqlite3.connect("database/gtfs_realtime.db")
 cursor_realtime = conn_realtime.cursor()
 
-# 🚏 GTFS Static Tables (Schedules, Routes, Stops)
+# GTFS Static Tables (Schedules, Routes, Stops)
 cursor_static.executescript("""
 CREATE TABLE IF NOT EXISTS stops (
     stop_id TEXT PRIMARY KEY,
@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS stop_times (
     stop_sequence INTEGER,
     arrival_time TEXT,
     departure_time TEXT,
-    shape_dist_traveled REAL,  -- ✅ Uses GTFS-provided distance
+    shape_dist_traveled REAL, 
     PRIMARY KEY (trip_id, stop_id),
     FOREIGN KEY (trip_id) REFERENCES trips(trip_id),
     FOREIGN KEY (stop_id) REFERENCES stops(stop_id)
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS stop_times (
 CREATE INDEX IF NOT EXISTS idx_stop_times_trip_stop ON stop_times (trip_id, stop_id);
 """)
 
-# 🕒 Real-Time GTFS Tables (Live Positions, Delays)
+# Real-Time GTFS Tables (Live Positions, Delays)
 cursor_realtime.executescript("""
 CREATE TABLE IF NOT EXISTS realtime_vehicle_positions (
     timestamp TEXT,
@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS stop_delays (
     FOREIGN KEY (stop_id) REFERENCES stops(stop_id)
 );
 
--- Add Index for Performance
+--  Indexing for Performance
 CREATE INDEX IF NOT EXISTS idx_stop_delays_trip_stop ON stop_delays (trip_id, stop_id);
 """)
 
@@ -92,4 +92,4 @@ conn_realtime.commit()
 conn_static.close()
 conn_realtime.close()
 
-print("✅ Database tables created successfully.")
+print("Database tables created successfully.")

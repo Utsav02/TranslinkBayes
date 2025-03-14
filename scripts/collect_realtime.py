@@ -35,7 +35,7 @@ cursor_realtime = conn_realtime.cursor()
 conn_static = sqlite3.connect("database/gtfs_static.db")
 cursor_static = conn_static.cursor()
 
-# 🚀 Helper Functions
+# Helper Functions
 PACIFIC_TZ = pytz.timezone("America/Vancouver")
 
 def convert_to_pacific(utc_time_str):
@@ -50,26 +50,23 @@ def fetch_realtime_data(url, data_type):
     try:
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
-            logging.info(f"✅ Successfully fetched {data_type} data from API.")
+            logging.info(f"Successfully fetched {data_type} data from API.")
             return response.content
         else:
-            logging.error(f"❌ API request failed for {data_type}: {response.status_code}")
+            logging.error(f"API request failed for {data_type}: {response.status_code}")
             return None
     except requests.RequestException as e:
-        logging.error(f"❌ Network error fetching {data_type}: {e}")
+        logging.error(f"Network error fetching {data_type}: {e}")
         return None
 
 def preload_scheduled_arrivals():
-    """Preload scheduled arrival times from stop_times to reduce database queries."""
     cursor_static.execute("SELECT trip_id, stop_id, arrival_time FROM stop_times")
     return {(row[0], row[1]): row[2] for row in cursor_static.fetchall()}
 
 def get_scheduled_arrival(trip_id, stop_id):
-    """Retrieve scheduled arrival time from preloaded data."""
     return scheduled_arrivals.get((trip_id, stop_id), None)
 
 def get_bus_id_for_trip(trip_id):
-    """Retrieve the latest bus_id for a trip from vehicle positions."""
     cursor_realtime.execute("""
         SELECT bus_id FROM realtime_vehicle_positions 
         WHERE trip_id = ? ORDER BY timestamp DESC LIMIT 1
@@ -77,10 +74,9 @@ def get_bus_id_for_trip(trip_id):
     result = cursor_realtime.fetchone()
     return result[0] if result else None
 
-# 🚏 Load scheduled arrivals to optimize queries
 scheduled_arrivals = preload_scheduled_arrivals()
 
-# 🚦 Store Trip Updates (Delays)
+# Store Trip Updates (Delays)
 def store_trip_updates():
     """Fetch and store trip delay information."""
     data = fetch_realtime_data(TRIP_UPDATES_URL, "trip_updates")
@@ -98,7 +94,7 @@ def store_trip_updates():
         if entity.HasField("trip_update"):
             trip_update = entity.trip_update
             trip_id = trip_update.trip.trip_id
-            route_id = trip_update.trip.route_id  # ✅ Added route_id
+            route_id = trip_update.trip.route_id  
             bus_id = get_bus_id_for_trip(trip_id)
 
             for stop_time_update in trip_update.stop_time_update:
@@ -114,7 +110,7 @@ def store_trip_updates():
                     bus_id, datetime.now(timezone.utc)
                 ))
 
-    logging.info(f"📝 Preparing {len(trip_updates)} trip updates for insertion.")
+    logging.info(f"Preparing {len(trip_updates)} trip updates for insertion.")
 
     cursor_realtime.executemany("""
         INSERT INTO stop_delays (
@@ -129,12 +125,12 @@ def store_trip_updates():
     """, trip_updates)
 
     conn_realtime.commit()
-    logging.info(f"✅ Stored {len(trip_updates)} trip updates successfully.")
+    logging.info(f"Stored {len(trip_updates)} trip updates successfully.")
 
-# 🚀 Run Collection
+# Run Collection
 logging.info("🚀 Running collect_realtime.py...")
 store_trip_updates()
-logging.info("✅ Finished collecting real-time data.")
+logging.info("Finished collecting real-time data.")
 
 conn_realtime.close()
 conn_static.close()
