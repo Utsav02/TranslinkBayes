@@ -21,11 +21,10 @@ I am using real-time and static GTFS datasets from TransLink. Static data comes 
 
 
 ## **Future Work**
-- Implement hierarchical Bayesian regression with **Stan/RStan**.
+- Implement hierarchical Bayesian regression with **RStan**.
 - Investigate **spatial dependencies** using latitude/longitude data.
 - Develop **a general stop-level model** that applies across multiple routes.
 - Provide **a probabilistic delay prediction model** with uncertainty estimates.
-- Validate findings using NYC MTA dataset.
 
 ## **References**
 Rodriguez et al. (2022). *Robust Real-Time Delay Predictions in a Network of High-Frequency Urban Buses.*
