@@ -1,0 +1,300 @@
+```{r}
+library(dplyr)
+library(ggplot2)
+library(DBI)
+library(RSQLite)
+library(readr)
+library(moments)
+library(e1071)
+library(MASS)
+library(fitdistrplus)
+
+```
+
+```{r}
+#Static connection; load only once (or when updates happen on Fridays)
+conn_static <- dbConnect(SQLite(), "../database/gtfs_static.db")
+stop_times <- dbReadTable(conn_static, "stop_times")
+trips <- dbReadTable(conn_static, "trips")
+dbDisconnect(conn_static)
+```
+
+```{r}
+#Realtime data; run everytime gets ideally updated every 5mins
+conn_realtime <- dbConnect(SQLite(), "../database/gtfs_realtime.db")
+stop_delays <- dbReadTable(conn_realtime, "stop_delays")
+
+stop_delays <- stop_delays %>%
+  arrange(trip_id, stop_sequence) %>%
+  group_by(trip_id) %>%
+  mutate(previous_stop_delay = lag(delay_seconds, order_by = stop_sequence)) %>%
+  ungroup()
+
+dbDisconnect(conn_realtime)
+```
+
+```{r}
+#Ensuring correct data types
+stop_times <- stop_times %>%
+  mutate(
+    trip_id = as.character(trip_id),
+    stop_id = as.character(stop_id),
+    stop_sequence = as.integer(stop_sequence),
+    shape_dist_traveled = as.numeric(shape_dist_traveled) 
+  )
+
+stop_delays <- stop_delays %>%
+  mutate(
+    trip_id = as.character(trip_id),
+    route_id = as.character(route_id),
+    stop_id = as.character(stop_id),
+    stop_sequence = as.integer(stop_sequence),
+    delay_seconds = as.numeric(delay_seconds)
+  )
+
+trips <- trips %>%
+  mutate(trip_id = as.character(trip_id),
+         route_id = as.character(route_id),
+         direction_id = as.integer(direction_id))
+```
+
+```{r warning=FALSE}
+
+#Join stop_delays with trips to get direction_id
+stop_delays_with_direction <- stop_delays %>%
+  left_join(trips %>% dplyr::select(trip_id, direction_id), by = "trip_id") %>%
+  filter(route_id == "6641")
+
+stop_delay_skew <- stop_delays_with_direction %>%
+  group_by(stop_sequence, direction_id) %>%
+  summarize(
+    skew_delay = skewness(delay_seconds, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+stop_delay_kurtosis <- stop_delays_with_direction %>%
+  group_by(stop_sequence, direction_id) %>%
+  summarize(
+    kurtosis_delay = kurtosis(delay_seconds, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Summarize delay by direction
+delay_summary <- stop_delays_with_direction %>%
+  group_by(direction_id, stop_sequence) %>%
+  summarize(
+    avg_delay = mean(delay_seconds, na.rm = TRUE),
+    sd_delay = sd(delay_seconds, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+#Recreating 4 plots from rodriguez et al to unnderstand the data distribution
+
+# Mean Delav vs Stop
+ggplot(delay_summary, aes(x = stop_sequence, y = avg_delay, color = as.factor(direction_id))) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = avg_delay - sd_delay, ymax = avg_delay + sd_delay), width = 0.2) +
+  scale_color_manual(values = c("blue", "red"), labels = c("Direction 0", "Direction 1")) +
+  labs(
+    title = "Average Delay Across Stops for Route 6641",
+    x = "Stop Sequence",
+    y = "Average Delay (seconds)",
+    color = "Direction"
+  ) +
+  theme_minimal()
+
+# SD Delay vs Stop
+ggplot(delay_summary, aes(x = stop_sequence, y = sd_delay^2, color = as.factor(direction_id))) +
+geom_point() + geom_line(linetype="dashed") +
+  scale_color_manual(values = c("blue", "red"), labels = c("Direction 0", "Direction 1")) +
+  labs(
+    title = "Variance of Delay Across Stops for Route 6641",
+    x = "Stop Sequence",
+    y = "Variance of Delay (seconds)",
+    color = "Direction"
+  ) +
+  theme_minimal()
+
+# Skewness of Delay vs Stop
+ggplot(stop_delay_skew, aes(x = stop_sequence, y = skew_delay, color = as.factor(direction_id))) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+    scale_color_manual(values = c("blue", "red"), labels = c("Direction 0", "Direction 1")) +
+  labs(
+    title = "Skewness of Delay Across Stops for Route 6641",
+    x = "Stop Sequence",
+    y = "Skewness of Delay",
+    color = "Direction"
+  ) +
+  theme_minimal()
+
+# Kurtosis of Delay vs Stop
+ggplot(stop_delay_kurtosis, aes(x = stop_sequence, y = kurtosis_delay, color = as.factor(direction_id))) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+      scale_color_manual(values = c("blue", "red"), labels = c("Direction 0", "Direction 1")) +
+  labs(
+    title = "Kurtosis of Delay Across Stops for Route 6641",
+    x = "Stop Sequence",
+    y = "Kurtosis of Delay",
+    color = "Direction"
+  ) +
+  theme_minimal()
+
+#Delay Distribution for Both Directions
+ggplot(stop_delays_with_direction, aes(x = delay_seconds, fill = as.factor(direction_id))) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 50) +
+  scale_fill_manual(values = c("blue", "red"), labels = c("Direction 0", "Direction 1")) +
+  labs(title = "Delay Distribution by Direction", x = "Delay (seconds)", y = "Count", fill = "Direction") +
+  theme_minimal()
+
+
+```
+
+```{r}
+selected_route <- "6641" #bus route 99
+
+route_trips <- trips %>%
+  filter(route_id == selected_route) %>%
+  dplyr::select(trip_id)
+
+valid_trips <- stop_delays %>%
+  filter(trip_id %in% route_trips$trip_id) %>%
+  distinct(trip_id)
+
+route_trips <- stop_times %>%
+  filter(trip_id %in% valid_trips$trip_id) %>%
+  group_by(trip_id) %>%
+  summarize(stop_count = n(), .groups = "drop")
+
+expected_stop_count <- route_trips %>%
+  count(stop_count, sort = TRUE) %>%
+  slice(1) %>%
+  pull(stop_count)
+
+full_completed_trips <- route_trips %>%
+  filter(stop_count == expected_stop_count) %>%
+  pull(trip_id)
+
+trip_stops <- stop_times %>%
+  filter(trip_id %in% full_completed_trips) %>%
+  arrange(trip_id, stop_sequence)
+
+trip_delays <- stop_delays %>%
+  filter(trip_id %in% full_completed_trips)
+
+trip_data <- trip_stops %>%
+  left_join(trip_delays, by = c("trip_id", "stop_id", "stop_sequence")) %>%
+  arrange(trip_id, stop_sequence) %>%
+  mutate(delay_seconds = ifelse(is.na(delay_seconds), 0, delay_seconds))
+
+trip_data <- trip_data %>%
+  group_by(trip_id) %>%
+  arrange(stop_sequence) %>%
+  mutate(shape_dist_traveled = shape_dist_traveled - min(shape_dist_traveled, na.rm = TRUE)) %>%
+  ungroup()
+
+trip_summary <- trip_data %>%
+  group_by(stop_sequence) %>%
+  summarize(
+    avg_delay = mean(delay_seconds, na.rm = TRUE),
+    sd_delay = sd(delay_seconds, na.rm = TRUE),
+    avg_distance = mean(shape_dist_traveled, na.rm = TRUE), 
+    n = n(),
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+ggplot(trip_summary, aes(x = as.factor(stop_sequence), y = avg_delay)) +
+  geom_line(group = 1, color = "blue", size = 1) +  
+  geom_point(color = "red", size = 3) +
+  geom_errorbar(aes(ymin = avg_delay - sd_delay, ymax = avg_delay + sd_delay), width = 0.2) +
+  scale_x_discrete(name = "Stop Sequence") + 
+  labs(
+    title = paste("Average Delay Across Stops for Route", selected_route),
+    y = "Average Delay (seconds)"
+  ) +
+  theme_minimal()
+
+
+ggplot(trip_summary, aes(x = avg_distance, y = avg_delay)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 3) +
+  labs(
+    title = paste("Delay vs. Distance Traveled for Route", selected_route),
+    x = "Distance Traveled (km)",
+    y = "Average Delay (seconds)"
+  ) +
+  theme_minimal()
+
+
+ggplot(trip_summary, aes(x = avg_distance, y = sd_delay^2)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 3) +
+  labs(
+    title = paste("Variation vs Distance", selected_route),
+    x = "Distance Traveled (km)",
+    y = "Standard Deviation of Delay (seconds)"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+```{r}
+stop_delays_with_direction_1 <- stop_delays_with_direction %>% filter(direction_id == "1")
+#37810 for R4
+ggplot(stop_delays_with_direction_1, aes(x = delay_seconds)) +
+  geom_histogram(bins = 50, fill = "blue", alpha = 0.5) +
+  labs(title = "Delay Distribution", x = "Delay (seconds)", y = "Density") +
+  theme_minimal()
+
+skewness(stop_delays_with_direction_1$delay_seconds, na.rm = TRUE)
+kurtosis(stop_delays_with_direction_1$delay_seconds, na.rm = TRUE)
+
+ggplot(stop_delays_with_direction, aes(x = stop_sequence, y = delay_seconds)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess", color = "red", se = FALSE) +
+  labs(title = "Delay Across Stop Sequence", x = "Stop Sequence", y = "Delay (seconds)") +
+  theme_minimal()
+
+
+```
+
+```{r}
+ggplot(stop_delays_with_direction_1, aes(x = previous_stop_delay, y = delay_seconds)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Previous Stop Delay vs Current Stop Delay", x = "Previous Stop Delay (s)", y = "Current Delay (s)") +
+  theme_minimal()
+
+```
+
+```{r}
+#Checking student t assumption for 99 route
+route_delays <- stop_delays_with_direction %>% filter(route_id == "6641" ) %>% pull(delay_seconds)
+clean_route_delays <- route_delays[!is.na(route_delays)]
+
+# Fit Student-t distribution
+fit_t <- fitdistr(
+  clean_route_delays,
+  "t", 
+  start = list(m = mean(clean_route_delays),
+               s = sd(clean_route_delays), 
+               df = 3))
+# Fit norm
+fit_norm <- fitdistr(clean_route_delays, "normal")
+
+hist(clean_route_delays, probability = TRUE, breaks = 50, col = "grey", main = "Fit : Student-t vs Normal")
+curve(dnorm(x, mean = fit_norm$estimate["mean"], sd = fit_norm$estimate["sd"]), 
+      col = "blue", lwd = 2, add = TRUE)
+curve(dt((x - fit_t$estimate["m"]) / fit_t$estimate["s"], df = fit_t$estimate["df"]) / fit_t$estimate["s"], 
+      col = "red", lwd = 2, add = TRUE)
+
+legend("topright", legend = c("Normal", "Student-t"), col = c("blue", "red"), lwd = 2)
+```
