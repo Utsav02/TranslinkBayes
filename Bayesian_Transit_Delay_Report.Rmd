@@ -38,19 +38,19 @@ Metro Vancouver’s bus transit system, operated by TransLink, is one of the mos
 
 # Literature Review
 
-Rodriguez-Deniz and Villani (2022) introduced a robust Bayesian framework for real-time bus delay prediction across high-frequency transit systems. Their model accounted for the heavy-tailed nature of delay distributions using a Student-$t$ likelihood and included hierarchical structure to capture variations at the trip and stop levels. Most ingenous was the use of geometrically discounted past delays and dynamic modeling of the scale and degrees-of-freedom parameters allow for time-varying uncertainty.
+Rodriguez-Deniz and Villani (2022) introduced a robust Bayesian framework for real-time bus delay prediction across high-frequency transit systems. Their model accounted for the heavy-tailed nature of delay distributions using a Student-$t$ likelihood and included hierarchical structure to capture variations at the trip and stop levels. Most interesting was their use of geometrically discounted past delays, and dynamic modeling of the scale and degrees-of-freedom parameters which allowed them to model time-varying uncertainty.
 
-In contrast, this implementation adopts and simplifies the core components of their framework. A Student-$t$ likelihood is used to maintain robustness to outliers and incorporate random effects for both trips and stops. Covariates such as previous stop delay, hour of the day, and day of the week are included and extend the model with an autoregressive (AR(1)) term to partially capture short-term temporal dependencies. To simplify and test the implementation first, instead of using a weighted lag structure that Rodriguez et al. (2022) used, this implementation just uses a single lag. Thereofre, an assumption which makes sense in its logic is applied: a bus' delay is affected by how late it was on the previous stop.
+In contrast, this implementation adopts and simplifies the core components of their framework. A Student-$t$ likelihood is used to maintain robustness to outliers and incorporate random effects for both trips and stops. Covariates such as previous stop delay, hour of the day, and day of the week are included and extend the model with an autoregressive (AR(1)) term to partially capture short-term temporal dependencies. To simplify and test the implementation first, instead of using a weighted lag structure that Rodriguez et al. (2022) used, this implementation just uses a single lag. This assumption in simpler logic can be framed as: a bus' delay is affected by how late it was on the previous stop.
 
 # Problem Formulation
 
-The core inference task in this project is to predict bus delays at individual stops using a Bayesian model that incorporates spatial, temporal, and historical features. Given observed features such as prior stop delay, shape distance, and timestamp-based covariates (hour and weekday), we try to estimate the current delay and provide uncertainty estimates for this prediction. The model outputs can assist both transit operators and riders by forecasting potential lateness and its likelihood, which is crucial in high-frequency urban bus networks.
+The core inference task in this project is to predict bus delays at individual stops using a Bayesian model that incorporates spatial, temporal, and historical records. Given observed features such as prior stop delay, distance, and time-based covariates (hour and weekday), the model will try to estimate the current delay and provide uncertainty estimates for this prediction. The model outputs can assist both transit operators and riders by forecasting potential lateness and its likelihood, which is crucial in high-frequency urban bus networks.
 
-For the project, this implementation fits under the **Bayesian regression and time series modeling** theme, and extends it by introducing hierarchical structure (trip and stop-level variation), temporal dependence through an AR(1) term, and spatial features through shape distance. Given the real-world nature of the problem and the availability of large, noisy datasets, and using Rodriguez-Deniz and Villani (2022) as the reference, the use of a robust Student-$t$ likelihood further strengthens the model’s reliability.
+For the project, this implementation fits under the **Bayesian regression and time series modeling** theme, and extends it by introducing hierarchical structure (trip and stop-level variation), temporal dependence through an AR(1) term, and spatial features through distance traveled. Given the real-world nature of the problem and the availability of large, noisy datasets, and using Rodriguez-Deniz and Villani (2022) as the reference, the use of a robust Student-$t$ likelihood further strengthens the model’s reliability.
 
 # Dataset Description
 
-The project makes use of data obtained through the real-time and static GTFS API from TransLink. Static data comes from TransLink’s website (<https://www.translink.ca/about-us/doing-business-with-translink/app-developer-resources/gtfs/gtfs-data>) and the real-time data is stored by a python script running on the local computer every five minutes in an SQLite database
+The project makes use of data obtained through the real-time and static GTFS API from TransLink. Static data comes from TransLink’s website (<https://www.translink.ca/about-us/doing-business-with-translink/app-developer-resources/gtfs/gtfs-data>) and the real-time data is stored by a python script running on the local computer every five minutes in an SQLite database. For this report, only one route's data has been modeled: Route 6641 for Bus 99.
 
 ```{r, echo=FALSE}
 library(rstan)
@@ -93,12 +93,12 @@ $$
 y_i \sim \text{Student-}t(\nu, \mu_i, \sigma)
 $$
 
--   $y_i$ is the **observed delay** (in seconds) at bus stop $i$,
--   $\mu_i$ is the **expected delay** predicted by the model for stop $i$,
--   $\nu$ is the degrees of freedom parameter, allowing the distribution to capture heavy tails (outliers),
--   $\sigma$ is the scale (standard deviation) of the Student-$t$ distribution.
+-   $y_i$ is the observed delay (in seconds) at bus stop $i$,
+-   $\mu_i$ is the expected delay predicted by the model for stop $i$,
+-   $\nu$ is the degrees of freedom parameter, allowing the distribution to capture outliers,
+-   $\sigma$ is the standard deviation of the Student-$t$ distribution.
 
-The expected delay $\mu_i$ is modeled as a linear combination of spatial, temporal, and hierarchical effects:
+The expected delay $\mu_i$ (whose values are positive for delay, negative for early, and zero for on time) is modeled as a linear combination of spatial, temporal, and hierarchical effects:
 
 $$
 \mu_i = \alpha + \beta_{\text{prev}} \cdot \text{prev-delay}_i + \beta_{\text{dist}} \cdot \text{distance}_i + \beta_{\text{hour}[h_i]} + \beta_{\text{dow}[d_i]} + \text{trip-effect}_{t_i} + \text{stop-effect}_{s_i} + \phi \cdot \text{prev-delay}_i
@@ -120,27 +120,27 @@ $$
 
 -   $\phi \cdot \text{prev-delay}_i$ : AR(1) dependecny modeling autocorrelation between consecutive delays within a trip.
 
-    This model structure allows for both fixed and random effects, enabling interpretable inference while accommodating the hierarchical and noisy nature of transit delay data. The Student-$t$ distribution provides robustness to outliers, a common occurrence in the real-world due to accidents, weather, or unexpected congestion.
+    This model structure allows for both fixed and random effects, enabling interpretable inference while accommodating the hierarchical and noisy nature of transit delay data. The Student-$t$ distribution provides robustness to outliers, which is more than a common occurrence in the real-world due to many reasons.
 
 ## Prior Choices
 
 To ensure the model remains interpretable, following prior distributions for each parameter were used:
 
 -   $\beta_{\cdot} \sim \mathcal{N}(0, 2)$:\
-    Serves as a weakly informative Gaussian prior placed on all regression coefficients. This centers the coefficients around zero, encouraging simplicity (shrinkage) while still allowing sufficient flexibility for the model to learn from the data. The standard deviation of 2 was selected to allow moderate deviation from zero, inspired by choices in related work (Rodriguez-Deniz & Villani, 2022 used $\mathcal{N}(0, 1)$).
+    A weakly informative Gaussian prior is placed on all regression coefficients. This centers the coefficients around zero, encouraging simplicity while still allowing sufficient flexibility for the model to learn from the data. The standard deviation of 2 was selected to allow moderate deviation from zero, based on choices in related work (Rodriguez-Deniz & Villani, 2022 used $\mathcal{N}(0, 1)$).
 
 -   $\sigma, \sigma_{\text{trip}}, \sigma_{\text{stop}} \sim \text{Exponential}(1)$:\
     Exponential priors are placed on the scale parameters for the observation noise and the standard deviations of the trip-level and stop-level random effects. These priors are appropriate for scale parameters because they constrain values to be positive while favoring smaller magnitudes. This encourages shrinkage of the random effects when data is not informative, thus preventing overfitting.
 
 -   $\nu \sim \text{Gamma}(2, 0.1)$:\
-    A gamma prior is used for the degrees of freedom in the Student-$t$ distribution. The chosen parameters encourage values close to 2 - 4, which induces heavy-tailed behavior, making the model robust to outliers. This setup aligns with Rodriguez-Deniz & Villani (2022), who used a Student-$t$ likelihood to model highly variable and noisy delay data.
+    A gamma prior is used for the degrees of freedom in the Student-$t$ distribution. The chosen parameters encourage values close to 2, which resembles heavy-tailed behavior, making the model robust to outliers.
 
 -   $\phi \sim \text{Uniform}(-1, 1)$:\
     Based on time-series course, this prior is placed on the autoregressive parameter. The uniform distribution ensures the parameter stays within the stationarity region of AR(1) models (i.e., $|\phi| < 1$).
 
 # Model Diagnostics
 
-Two models were compared in this project. A baseline model excluding both stop-level random effects and autoregressive (AR(1)) components was fitted. This was followed by an extended model that incorporates both stop-level variation and an AR(1)-like term to capture spatial and temporal dependencies in delay propagation.
+Two models were compared in this project. A baseline model excluding both stop-level random effects and autoregressive (AR(1)) components was fitted. This was followed by an extended model that incorporated both terms to capture spatial and temporal dependencies in delay propagation. Several comparisons were performed after checking that the chains mixed well. Below are the results and interpretation of them.
 
 ## Posterior Parameter Comparison
 
@@ -167,8 +167,8 @@ kable(param_table, caption = "Posterior Means for Selected Parameters (Base vs E
 -   **Previous Delay Coefficient**: Both models show positive coefficients (0.91, 0.97), indicating that delays tend to propagate. The slightly lower coefficient in the extended model may result from shared predictive power with AR(1) and stop-level effects.
 -   **Distance Coefficient**: Both coefficients are negative, implying stops on route far away from origin are associated with smaller delays.
 -   **Residual Standard Deviation (sigma):** It is substantially lower in the extended model, suggesting that introducing stop-level and AR(1) dependence has significantly improved the model’s ability to capture variability in delay.
--   **Degrees of Freedom**: When ν is smaller, the distribution has heavy tail. It is consistent with real-world delay distributions that include extreme cases.
--   **Autoregressive Coefficient**: Present only in the extended model (≈ 0.08), it captures autocorrelation in delays. We see that it adds marginal predictive strength beyond previous delay and reflects modest temporal dependence.
+-   **Degrees of Freedom**: When $\nu$ is smaller, the distribution has heavy tail. It is consistent with real-world delay distributions that include extreme cases.
+-   **Autoregressive Coefficient**: Present only in the extended model (0.08), it captures autocorrelation in delays. We see that it adds marginal predictive strength beyond previous delay.
 
 ## Leave One Out (LOO):
 
@@ -194,6 +194,8 @@ kable(loo_df, caption = "LOO Summary for Base and Extended Models", digits = 2)
 ```
 
 -   The extended model outperforms the base model in predictive accuracy, as shown by its higher ELPD LOO (expected log predictive density) and lower LOOIC (leave-one-out information criterion). This means the extended model is better at predicting unseen data while accounting for uncertainty. The extended model also has a higher effective number of parameters (p_loo), suggesting it is more flexible and complex. This can be considered a trade-off which implies that the extended model captures more structure in the data such as stop-level and autocorrelated effects leading to improved predictive performance but more complex.
+
+## Visual Analysis using Posterior Distribution Check and Residuals
 
 ```{r, echo=FALSE, fig.height=2}
 library(rstan)
@@ -249,7 +251,7 @@ p1 <- ggplot(ppc_df) +
   geom_histogram(aes(x = observed, y = ..density..), fill = "grey", bins = 40) +
   geom_density(aes(x = base_sim), color = "blue", size = 1.2) +
   geom_density(aes(x = ext_sim), color = "red", size = 1.2) +
-  labs(title = "PPC: Base vs Extended",
+  labs(title = "Base vs Extended",
        x = "Delay (Seconds)",
        y = "Density")+
   xlim(-1000, 1000) +
@@ -327,6 +329,8 @@ Rodriguez-Deniz, H., & Villani, M. (2022). Robust Real-Time Delay Predictions in
 Format for the report was taken from STAT 450: Case Studies in Statistics
 
 # Appendix
+
+There is a section where after downloading the models from github, one can explore without having to fit it again as it took a long time to compile given the amount of data.
 
 ## Loading the Data
 
