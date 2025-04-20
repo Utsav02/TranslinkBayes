@@ -17,7 +17,7 @@ output:
   {\Large STAT 447C: Bayesian Statistics \par}
   \vspace{1cm}
   {\large \textbf{Submitted by:} \\[0.2cm]
-  Utsav Singh \par}
+  Utsav Singh\\ https://github.com/Utsav02/TranslinkBayes \par}
   \vspace{1cm}
   {\large \textbf{Instructor:} \\[0.2cm]
   Alexandre Bouchard-Côté \par}
@@ -58,7 +58,7 @@ library(ggplot2)
 library(knitr)
 library(dplyr)
 library(kableExtra)
-merged_data = read.csv('../test.csv')
+merged_data = read.csv('test.csv')
 filtered_data <- merged_data %>%
   filter(!is.na(delay_seconds),
          !is.na(previous_stop_delay),
@@ -145,8 +145,8 @@ Two models were compared in this project. A baseline model excluding both stop-l
 ## Posterior Parameter Comparison
 
 ```{r results='asis', echo=FALSE}
-fit_base = readRDS("fit_base_1000.rds")
-fit_extended = readRDS("fit_extended_1000.rds")
+fit_base = readRDS("models/fit_base_1000.rds")
+fit_extended = readRDS("models/fit_extended_1000.rds")
 
 params <- c("alpha", "beta_prev", "beta_dist", "sigma", "nu", "phi")
 summ_base <- summary(fit_base, pars = intersect(params, names(fit_base@sim$samples[[1]])))$summary
