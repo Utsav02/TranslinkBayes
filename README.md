@@ -1,5 +1,9 @@
 # **Bayesian Delay Propagation in Vancouver Bus Transit Network**
 
+## Reproducibility
+Download the two model files from the model folder and run the code in the appendix of Bayesian_Transit_Delay_Report.Rmd from the comment that says run the code from here where it loads the model from the folder.
+
+
 ## **Project Overview**
 Metro Vancouver’s bus transit system, operated by TransLink, is one of the finest in the continent. However, like all other transit systems around the globe, it experiences unpredictable delays due to congestion, weather, and operational inefficiencies. Through this project, I am trying to apply the concepts learned in the course and explore how Bayesian inference can be applied to model delay propagation in a high-frequency bus network of Vancouver using real-time GTFS data from TransLink. The objective is to develop a probabilistic framework for delay prediction while capturing uncertainty, leveraging historical data and hierarchical Bayesian modeling.
 
