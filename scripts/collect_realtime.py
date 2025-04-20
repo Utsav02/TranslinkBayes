@@ -128,7 +128,7 @@ def store_trip_updates():
     logging.info(f"Stored {len(trip_updates)} trip updates successfully.")
 
 # Run Collection
-logging.info("🚀 Running collect_realtime.py...")
+logging.info("Running collect_realtime.py...")
 store_trip_updates()
 logging.info("Finished collecting real-time data.")
 

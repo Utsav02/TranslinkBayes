@@ -99,3 +99,5 @@ def update_hash_file(new_hashes):
 
 if __name__ == "__main__":
     check_gtfs_changes()
+    
+    
