@@ -7,7 +7,7 @@ Metro Vancouver’s bus transit system, operated by TransLink, is one of the fin
 My project is heavily influenced by a previous study conducted in Sweden taking a similar Bayesian approach (Rodriguez et al. (2022)).  Based on the project proposal themes, this project aligns with the theme of Bayesian regression and time series modeling. It can also be considered a spatial model since the dataset does have longitudes and latitudes, however, my current approach is not using it but I plan to try incorporating it by the project report.
 
 ## **Datasets & Data Collection**
-I am using real-time and static GTFS datasets from TransLink. Static data comes from TransLink’s website (https://www.translink.ca/about-us/doing-business-with-translink/app-developer-resources/gtfs/gtfs-data) and the Real-time data is obtained by a Python script running on my local computer every 5 mins that stores the data in an SQLite database. The project structure is outlined in detail in the ReadMe file on the GitHub Repository. 
+I am using real-time and static GTFS datasets from TransLink. Static data comes from TransLink’s website (https://www.translink.ca/about-us/doing-business-with-translink/app-developer-resources/gtfs/gtfs-data) and the Real-time data is obtained by a Python script running on my local computer every 5 mins that stores the data in an SQLite database. 
 
 
 ## **Project Methodology**
