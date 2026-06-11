@@ -7,7 +7,7 @@ SINCE   ?= 2026-05-09# quality baseline cutoff — see CLAUDE.md "Data quality b
 ROUTE   ?= 6641
 DIR     ?= 0
 
-.PHONY: help venv process quality export export-all refresh refresh-render \
+.PHONY: help venv test process quality export export-all refresh refresh-render \
         dashboard render collect-status
 
 help:
@@ -16,6 +16,9 @@ help:
 venv: ## create venv and install pinned requirements
 	python3 -m venv venv
 	$(PY) -m pip install -r requirements.txt
+
+test: ## run smoke tests (pure-logic, no DB needed)
+	$(PY) -m pytest tests/ -q
 
 process: ## rebuild processed_stops since $(SINCE)
 	$(PY) pipeline/process_delays.py --since $(SINCE)

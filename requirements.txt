@@ -34,3 +34,10 @@ shapely==2.1.2
 # Misc (present in venv, kept for completeness)
 haversine==2.9.0
 networkx==3.4.2
+
+# Testing (make test)
+pytest==9.0.3
+iniconfig==2.3.0
+pluggy==1.6.0
+packaging==26.2
+Pygments==2.20.0
