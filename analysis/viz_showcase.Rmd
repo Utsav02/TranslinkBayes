@@ -1,0 +1,585 @@
+---
+title: "TransLink Bayesian Delay — Visualization Showcase"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      cache = TRUE, cache.lazy = FALSE,
+                      fig.width = 10, fig.height = 5)
+```
+
+```{r libs, cache=FALSE}
+library(brms)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(bayesplot)
+library(patchwork)
+library(arrow)
+library(DBI)
+library(RSQLite)
+library(scales)
+
+options(mc.cores = parallel::detectCores())
+theme_set(theme_minimal(base_size = 13))
+```
+
+```{r load_models, cache=TRUE}
+m0 <- readRDS("models/brms_m0.rds")
+m1 <- readRDS("models/brms_m1.rds")
+m2 <- readRDS("models/brms_m2.rds")
+m3 <- readRDS("models/brms_m3_multiRoute.rds")
+```
+
+```{r load_data, cache=TRUE}
+# Auto-discover latest parquets so this file doesn't need manual date updates
+pq_6641 <- tail(sort(list.files("../exports", pattern = "route6641_dir0_.*\\.parquet",
+                                 full.names = TRUE)), 1)
+pq_all  <- tail(sort(list.files("../exports", pattern = "all_routes_.*\\.parquet",
+                                 full.names = TRUE)), 1)
+
+filter_and_clean <- function(df) {
+  df %>%
+    filter(
+      !is.na(delay_seconds), !is.na(previous_stop_delay),
+      !is.na(shape_dist_traveled), !is.na(hour),
+      !is.na(stop_id), !is.na(trip_id),
+      abs(delay_seconds)       <= 3600,
+      abs(previous_stop_delay) <= 3600
+    ) %>%
+    mutate(
+      timestamp = as.POSIXct(timestamp, tz = "UTC"),
+      date      = as.Date(timestamp),
+      hour      = as.integer(hour),
+      dow       = as.integer(wday(timestamp, week_start = 1L)),
+      trip_id   = as.character(trip_id),
+      stop_id   = as.character(stop_id)
+    )
+}
+
+anomaly_exclude <- function(df) {
+  daily <- df %>% group_by(date) %>%
+    summarise(n = n(), mean_d = mean(delay_seconds, na.rm = TRUE), .groups = "drop")
+  gm <- mean(daily$mean_d)
+  gs <- sd(daily$mean_d)
+  bad <- daily %>%
+    filter(n < 0.20 * median(daily$n) | abs(mean_d - gm) > 2 * gs) %>%
+    pull(date)
+  df %>% filter(!date %in% bad)
+}
+
+raw6641 <- read_parquet(pq_6641) %>% filter_and_clean() %>% anomaly_exclude()
+rawAll  <- read_parquet(pq_all)  %>%
+  filter(route_id != "") %>%
+  filter_and_clean() %>%
+  anomaly_exclude() %>%
+  mutate(route_id = as.character(route_id))
+
+# Train / test split for route 6641
+dates6641  <- sort(unique(raw6641$date))
+cutoff6641 <- dates6641[floor(0.75 * length(dates6641))]
+train6641  <- filter(raw6641, date <= cutoff6641)
+test6641   <- filter(raw6641, date >  cutoff6641)
+
+cat(sprintf("Route 6641 — train: %d rows  test: %d rows\n",
+            nrow(train6641), nrow(test6641)))
+cat(sprintf("All routes  — %s rows, %d routes\n",
+            format(nrow(rawAll), big.mark = ","),
+            n_distinct(rawAll$route_id)))
+```
+
+---
+
+# Viz 1 — Delay propagates 1:1 across stops
+
+**What:** Scatter of current stop delay vs previous stop delay, with the posterior
+mean slope and 90 % credible band.
+**Why:** The slope ≈ 1.0 is the headline finding — one second late at stop N
+predicts one second late at stop N+1, across all hours and routes.
+
+```{r viz1_grid, cache=TRUE}
+psd_range <- quantile(train6641$previous_stop_delay, c(0.02, 0.98))
+pred_grid <- data.frame(
+  previous_stop_delay = seq(psd_range[1], psd_range[2], length.out = 120),
+  shape_dist_traveled = median(train6641$shape_dist_traveled),
+  hour                = 8L,   # fix at 8am
+  dow                 = 2L,   # fix at Tuesday
+  trip_id             = train6641$trip_id[1],
+  stop_id             = train6641$stop_id[1]
+)
+
+fv <- fitted(m2, newdata = pred_grid, re_formula = NA,
+             allow_new_levels = TRUE, probs = c(0.05, 0.95))
+pred_grid <- pred_grid %>%
+  mutate(fit = fv[, "Estimate"], lo = fv[, "Q5"], hi = fv[, "Q95"])
+```
+
+```{r viz1_plot, fig.height=5, cache=FALSE}
+set.seed(1)
+scatter_sample <- slice_sample(test6641, n = min(3000, nrow(test6641)))
+
+b     <- fixef(m2)["previous_stop_delay", "Estimate"]
+b_lo  <- fixef(m2)["previous_stop_delay", "Q2.5"]
+b_hi  <- fixef(m2)["previous_stop_delay", "Q97.5"]
+
+ggplot() +
+  geom_point(data = scatter_sample,
+             aes(x = previous_stop_delay, y = delay_seconds),
+             alpha = 0.12, size = 0.9, color = "steelblue") +
+  geom_ribbon(data = pred_grid,
+              aes(x = previous_stop_delay, ymin = lo, ymax = hi),
+              fill = "coral", alpha = 0.35) +
+  geom_line(data = pred_grid,
+            aes(x = previous_stop_delay, y = fit),
+            color = "coral", linewidth = 1.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", alpha = 0.4) +
+  coord_cartesian(xlim = c(-250, 250), ylim = c(-250, 250)) +
+  labs(
+    title   = "Delay propagates almost perfectly from stop to stop",
+    subtitle = sprintf("Posterior slope = %.4f  [%.4f, %.4f]  (dashed = perfect 1:1)",
+                       b, b_lo, b_hi),
+    x = "Previous stop delay (s)",
+    y = "Current stop delay (s)",
+    caption = "Route 6641 — holdout test set  |  90% credible band at median hour/DOW"
+  )
+```
+
+---
+
+# Viz 2 — Hour-of-day effect: factor vs cyclic spline
+
+**What:** How the model's prediction shifts by hour, comparing 24 raw dummy
+variables (M0) against a smooth cyclic cubic spline (M1).
+**Why:** M1 is better because midnight is not discontinuous — hour 23 should
+flow back into hour 0. The spline enforces that.
+
+```{r viz2_m1_grid, cache=TRUE}
+hour_grid <- data.frame(
+  hour                = 0:23,
+  dow                 = 1L,
+  previous_stop_delay = 0,
+  shape_dist_traveled = median(train6641$shape_dist_traveled),
+  trip_id             = train6641$trip_id[1],
+  stop_id             = train6641$stop_id[1]
+)
+fv_m1 <- as.data.frame(fitted(m1, newdata = hour_grid, re_formula = NA,
+                               allow_new_levels = TRUE))
+hour_m1_df <- bind_cols(hour_grid, fv_m1)
+```
+
+```{r viz2_plot, cache=FALSE}
+# M0: extract factor(hour) posterior means
+hour_m0_df <- as.data.frame(fixef(m0)) %>%
+  tibble::rownames_to_column("term") %>%
+  filter(grepl("^factorhour", term)) %>%
+  mutate(hour = as.integer(sub("factorhour", "", term))) %>%
+  select(hour, Estimate, Q2.5, Q97.5) %>%
+  bind_rows(data.frame(hour = 0L, Estimate = 0, Q2.5 = 0, Q97.5 = 0)) %>%
+  arrange(hour)
+
+p_m0 <- ggplot(hour_m0_df, aes(x = hour, y = Estimate)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5), alpha = 0.2, fill = "steelblue") +
+  geom_vline(xintercept = c(7, 9, 16, 18), linetype = "dotted", alpha = 0.4) +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "M0: 24 independent dummies", x = "Hour", y = "Hour effect (s)")
+
+p_m1 <- ggplot(hour_m1_df, aes(x = hour, y = Estimate)) +
+  geom_line(color = "coral", linewidth = 1) +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5), alpha = 0.2, fill = "coral") +
+  geom_vline(xintercept = c(7, 9, 16, 18), linetype = "dotted", alpha = 0.4) +
+  scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "M1: cyclic cubic spline (k = 8)",
+       x = "Hour", y = "Hour effect (s)")
+
+p_m0 + p_m1 +
+  plot_annotation(
+    title    = "Cyclic spline vs 24 dummies for time-of-day",
+    subtitle = "Dotted lines = rush hour boundaries  |  Previous delay, distance fixed at median"
+  )
+```
+
+---
+
+# Viz 3 — Which routes run systematically late?
+
+**What:** Posterior random intercepts from M3 for 50 routes, sorted by effect.
+Positive = consistently later than average; negative = consistently earlier.
+**Why:** After controlling for delay propagation, distance, and time patterns,
+the residual route effect reveals structural differences (traffic, route length, stops).
+
+```{r viz3_plot, fig.height=9}
+re_df <- ranef(m3)$route_id %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("route_id") %>%
+  rename(Estimate = Estimate.Intercept,
+         Q2.5     = Q2.5.Intercept,
+         Q97.5    = Q97.5.Intercept) %>%
+  arrange(Estimate) %>%
+  mutate(
+    route_id = factor(route_id, levels = route_id),
+    sign     = ifelse(Estimate > 0, "Late", "Early")
+  )
+
+ggplot(re_df, aes(x = Estimate, y = route_id, color = sign)) +
+  geom_point(size = 2) +
+  geom_errorbarh(aes(xmin = Q2.5, xmax = Q97.5), height = 0.4, alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.6) +
+  scale_color_manual(values = c("Late" = "coral", "Early" = "steelblue"),
+                     guide = "none") +
+  labs(
+    title    = "Route-level random intercepts (M3) — who runs late?",
+    subtitle = "After controlling for delay propagation, distance, hour, and day of week",
+    x        = "Systematic offset (seconds)",
+    y        = "Route ID",
+    caption  = "Points = posterior mean  |  Bars = 95% credible interval"
+  )
+```
+
+---
+
+# Viz 4 — Does the model actually fit the data?
+
+**What:** 50 delay distributions simulated from the posterior (light lines) vs
+the observed distribution (dark line). If the model fits, they should overlap.
+**Why:** The standard Bayesian goodness-of-fit check. A Normal model would
+fail here — the observed distribution has heavier tails.
+
+```{r viz4_plot}
+p_ppc_m2 <- pp_check(m2, ndraws = 50, type = "dens_overlay") +
+  coord_cartesian(xlim = c(-400, 600)) +
+  labs(title = "M2 — Route 6641") +
+  theme(legend.position = "none")
+
+p_ppc_m3 <- pp_check(m3, ndraws = 50, type = "dens_overlay") +
+  coord_cartesian(xlim = c(-400, 600)) +
+  labs(title = "M3 — 50 routes") +
+  theme(legend.position = "bottom")
+
+p_ppc_m2 + p_ppc_m3 +
+  plot_annotation(
+    title    = "Posterior predictive check: model vs observed delay distribution",
+    subtitle = "Light lines = 50 draws from posterior predictive  |  Dark line = observed"
+  )
+```
+
+---
+
+# Viz 5 — Are findings stable week over week?
+
+**What:** Key parameters (`b_previous_stop_delay`, MAE) plotted across run dates.
+Each point is one weekly refresh. Error bars = 95% credible interval.
+**Why:** The most important robustness check — if coefficients bounce wildly as data
+accumulates, the model may be overfit to one week. Stability = credible findings.
+
+```{r viz5_plot, cache=FALSE}
+run_log <- read.csv("../exports/run_log.csv", stringsAsFactors = FALSE) %>%
+  mutate(run_date  = as.Date(run_date),
+         model_tag = ifelse(is.na(n_routes), "M2 (Route 6641)", "M3 (50 routes)"))
+
+p_b <- ggplot(run_log, aes(x = run_date, y = b_prev_delay_mean,
+                            ymin = b_prev_delay_q2.5, ymax = b_prev_delay_q97.5,
+                            color = model_tag, fill = model_tag)) +
+  geom_hline(yintercept = 1, linetype = "dashed", alpha = 0.4) +
+  geom_ribbon(alpha = 0.15, linewidth = 0) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("M2 (Route 6641)" = "steelblue",
+                                "M3 (50 routes)"  = "coral")) +
+  scale_fill_manual( values = c("M2 (Route 6641)" = "steelblue",
+                                "M3 (50 routes)"  = "coral")) +
+  labs(title = "Propagation coefficient over time",
+       subtitle = "Should hover near 1.0 — drift indicates data shift",
+       x = NULL, y = "b_prev_delay", color = NULL, fill = NULL) +
+  theme(legend.position = "top")
+
+p_mae <- ggplot(run_log, aes(x = run_date, y = mae,
+                              color = model_tag, group = model_tag)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("M2 (Route 6641)" = "steelblue",
+                                "M3 (50 routes)"  = "coral"),
+                     guide = "none") +
+  labs(title = "Holdout MAE over time",
+       subtitle = "Lower = better; stability = model isn't overfitting to one period",
+       x = "Run date", y = "MAE (seconds)")
+
+p_b / p_mae +
+  plot_annotation(
+    caption = sprintf("Showing %d run(s) — add weekly refreshes to see trend",
+                      nrow(run_log))
+  )
+```
+
+---
+
+# Viz 6 — When are buses late? Hour × Day heatmap
+
+**What:** Mean delay for every combination of hour (x) and day of week (y)
+across all 230 routes. Color = running late (red) vs early (blue).
+**Why:** Makes the "cyclic time" structure concrete — rush hours stand out
+visually, and the weekend pattern differs from weekdays.
+
+```{r viz6_static}
+heat_df <- rawAll %>%
+  group_by(hour, dow) %>%
+  summarise(mean_delay = mean(delay_seconds, na.rm = TRUE),
+            n = n(), .groups = "drop") %>%
+  mutate(dow_label = factor(dow, levels = 1:7,
+                            labels = c("Mon","Tue","Wed","Thu","Fri","Sat","Sun")))
+
+lim <- max(abs(heat_df$mean_delay), na.rm = TRUE)
+lim <- min(lim, 120)  # cap color scale at ±2 min for readability
+
+ggplot(heat_df, aes(x = hour, y = dow_label, fill = mean_delay)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = ifelse(abs(mean_delay) > 10,
+                               sprintf("%+.0f", mean_delay), "")),
+            size = 2.8, color = "white", fontface = "bold") +
+  scale_fill_gradient2(
+    low = "steelblue", mid = "white", high = "coral",
+    midpoint = 0, limits = c(-lim, lim),
+    oob = squish,
+    name = "Mean delay (s)",
+    labels = function(x) ifelse(x > 0, sprintf("+%ds", x), sprintf("%ds", x))
+  ) +
+  scale_x_continuous(breaks = seq(0, 23, 3),
+                     labels = function(h) sprintf("%02d:00", h)) +
+  labs(
+    title    = "Mean delay by hour and day of week — all 230 routes",
+    subtitle = "Red = running late  |  Blue = running early  |  White = on time",
+    x = "Hour of day", y = NULL
+  ) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r viz6_animated, eval=requireNamespace("gganimate", quietly=TRUE), fig.height=4}
+# library(gganimate)
+
+# # Animate delay density shifting across hours of day
+# set.seed(42)
+# anim_df <- rawAll %>%
+#   filter(!is.na(hour), !is.na(delay_seconds)) %>%
+#   group_by(hour) %>%
+#   slice_sample(n = 800L) %>%
+#   ungroup() %>%
+#   mutate(hour_label = sprintf("Hour %02d:00", hour))
+
+# anim <- ggplot(anim_df, aes(x = delay_seconds)) +
+#   geom_histogram(aes(y = after_stat(density)),
+#                  bins = 50, fill = "steelblue", alpha = 0.7, color = "white") +
+#   geom_vline(xintercept = 0, linetype = "dashed", color = "coral", linewidth = 1) +
+#   coord_cartesian(xlim = c(-300, 600)) +
+#   labs(
+#     title    = "Delay distribution at {closest_state}",
+#     subtitle = "Watch delays shift during morning and evening rush hours",
+#     x        = "Delay (seconds)",
+#     y        = "Density",
+#     caption  = "0s = on time  |  Positive = running late"
+#   ) +
+#   transition_states(hour_label, transition_length = 2, state_length = 1) +
+#   ease_aes("sine-in-out")
+
+# animate(anim, fps = 6, nframes = 72, width = 800, height = 400,
+#         renderer = gifski_renderer())
+```
+
+---
+
+# Viz 7 — Why Student-t? Heavy tails explained
+
+**What:** Overlay of three density curves — observed delay residuals, the
+best-fit Normal, and the fitted Student-t (ν ≈ 2). The shaded region shows
+tail probability the Normal model misses.
+**Why:** ν = 2.01 means the distribution is near-Cauchy — it has no finite
+variance theoretically. Extreme delays (snow storms, accidents) are much more
+common than a Normal model would predict.
+
+```{r viz7_plot}
+ps        <- posterior_summary(m2)
+nu_hat    <- ps["nu",    "Estimate"]
+sigma_hat <- ps["sigma", "Estimate"]
+
+x_seq <- seq(-250, 400, by = 0.5)
+
+# Approximate residuals: centre raw delays at their mean
+# Compute empirical sd before clipping tails for display so curves match the data
+full_r       <- raw6641$delay_seconds - mean(raw6641$delay_seconds)
+empirical_sd <- sd(full_r)
+resid_approx <- full_r[abs(full_r) <= 250]
+
+curve_df <- bind_rows(
+  data.frame(
+    x       = x_seq,
+    density = dnorm(x_seq, mean = 0, sd = empirical_sd),
+    model   = "Normal fit"
+  ),
+  data.frame(
+    x       = x_seq,
+    density = dt(x_seq / empirical_sd, df = nu_hat) / empirical_sd,
+    model   = sprintf("Student-t (ν = %.1f)", nu_hat)
+  )
+)
+
+ggplot() +
+  geom_histogram(
+    data = data.frame(r = resid_approx),
+    aes(x = r, y = after_stat(density)),
+    bins = 70, fill = "grey75", alpha = 0.6
+  ) +
+  # Shade tail region (|x| > 100s) to show Normal underestimates
+  geom_area(
+    data = filter(curve_df, model == "Normal fit", abs(x) > 100),
+    aes(x = x, y = density), fill = "steelblue", alpha = 0.25
+  ) +
+  geom_area(
+    data = filter(curve_df, grepl("Student", model), abs(x) > 100),
+    aes(x = x, y = density), fill = "coral", alpha = 0.25
+  ) +
+  geom_line(
+    data = curve_df,
+    aes(x = x, y = density, color = model, linetype = model),
+    linewidth = 1.2
+  ) +
+  scale_color_manual(
+    values = setNames(
+      c("steelblue", "coral"),
+      c("Normal fit", sprintf("Student-t (ν = %.1f)", nu_hat))
+    )
+  ) +
+  labs(
+    title    = "Bus delay distributions have near-Cauchy tails",
+    subtitle = sprintf(
+      "Fitted ν = %.2f — the Normal drastically underestimates tail probability (shaded)\nRoute 6641  |  σ = %.1fs",
+      nu_hat, sigma_hat),
+    x = "Delay residual (s)", y = "Density",
+    color = NULL, linetype = NULL,
+    caption = "Bars = observed delays (centred)  |  Shaded = tail region beyond ±100s"
+  ) +
+  theme(legend.position = "top")
+```
+
+---
+
+# Viz 8 — Bayesian vs frequentist: same conclusion, different language
+
+**What:** The 95% credible interval (Bayesian) vs 95% confidence interval
+(frequentist OLS) for the propagation coefficient, side by side.
+**Why:** Both agree the slope ≈ 1.0, which validates the finding. But the
+Bayesian CI has a direct probability statement: "95% chance the true slope
+is in this range given the data." The frequentist CI does not.
+
+```{r viz8_data, cache=TRUE}
+lm_fit <- lm(delay_seconds ~ previous_stop_delay + shape_dist_traveled,
+             data = train6641)
+lm_ci  <- confint(lm_fit)["previous_stop_delay", ]
+
+fe     <- fixef(m2)["previous_stop_delay", ]
+
+ci_df <- data.frame(
+  method   = c("Frequentist\n(OLS, 95% CI)", "Bayesian\n(brms M2, 95% CrI)"),
+  estimate = c(coef(lm_fit)["previous_stop_delay"], fe["Estimate"]),
+  lo       = c(lm_ci["2.5 %"],  fe["Q2.5"]),
+  hi       = c(lm_ci["97.5 %"], fe["Q97.5"]),
+  stringsAsFactors = FALSE
+)
+```
+
+```{r viz8_plot, cache=FALSE, fig.height=3.5}
+ggplot(ci_df, aes(y = method, x = estimate, xmin = lo, xmax = hi,
+                  color = method)) +
+  geom_vline(xintercept = 1, linetype = "dashed", alpha = 0.4) +
+  geom_errorbarh(height = 0.18, linewidth = 1.5) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("steelblue", "coral"), guide = "none") +
+  scale_x_continuous(labels = scales::label_number(accuracy = 0.001)) +
+  labs(
+    title    = "Both methods agree: delay propagation slope ≈ 1.0",
+    subtitle = "Bayesian 95% credible interval vs frequentist 95% confidence interval\nDotted line = perfect propagation (slope = 1)",
+    x        = "b_previous_stop_delay",
+    y        = NULL,
+    caption  = sprintf(
+      "OLS ignores random effects, splines, Student-t likelihood.\nBayesian R²: %.3f  |  OLS R²: %.3f",
+      bayes_R2(m2)[1, "Estimate"], summary(lm_fit)$r.squared
+    )
+  )
+```
+
+---
+
+# Viz 9 — Interactive stop map: where are buses late?
+
+**What:** Every bus stop in the TransLink network colored by mean observed delay.
+Green = running early, red = running late. Click a stop for details.
+**Why:** The spatial distribution of delays tells a different story than
+statistics alone — certain corridors and transfer hubs are consistently late.
+
+```{r viz9_plot, eval=requireNamespace("leaflet", quietly=TRUE), fig.height=6}
+library(leaflet)
+
+con_gtfs <- dbConnect(SQLite(), "../database/gtfs_static.db")
+stops_geo <- dbGetQuery(con_gtfs,
+  "SELECT stop_id, stop_name, stop_lat, stop_lon FROM stops
+   WHERE stop_lat IS NOT NULL AND stop_lon IS NOT NULL")
+dbDisconnect(con_gtfs)
+
+stop_delays <- rawAll %>%
+  group_by(stop_id) %>%
+  summarise(
+    mean_delay   = mean(delay_seconds, na.rm = TRUE),
+    median_delay = median(delay_seconds, na.rm = TRUE),
+    n_obs        = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n_obs >= 20)
+
+map_df <- inner_join(stop_delays, stops_geo, by = "stop_id") %>%
+  filter(!is.na(stop_lat), !is.na(stop_lon),
+         stop_lat > 48.9, stop_lat < 49.6,     # Metro Vancouver bounding box
+         stop_lon > -123.5, stop_lon < -122.2)
+
+# Color scale: capped at ±90s for readability
+pal <- colorNumeric(
+  palette = c("steelblue", "white", "coral"),
+  domain  = c(-90, 90),
+  na.color = "grey"
+)
+cap <- function(x) pmax(-90, pmin(90, x))
+
+leaflet(map_df) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addCircleMarkers(
+    lng         = ~stop_lon,
+    lat         = ~stop_lat,
+    radius      = ~pmax(3, pmin(7, log10(n_obs + 1) * 3)),
+    fillColor   = ~pal(cap(mean_delay)),
+    fillOpacity = 0.8,
+    color       = "white",
+    weight      = 0.5,
+    popup = ~paste0(
+      "<b>", stop_name, "</b><br>",
+      "Mean delay: <b>", round(mean_delay, 1), "s</b><br>",
+      "Median delay: ", round(median_delay, 1), "s<br>",
+      "Observations: ", format(n_obs, big.mark = ",")
+    )
+  ) %>%
+  addLegend(
+    "bottomright",
+    pal    = pal,
+    values = c(-90, 90),
+    title  = "Mean delay (s)<br><small>+ = late | − = early</small>",
+    labFormat = labelFormat(suffix = "s", transform = function(x) x)
+  ) %>%
+  setView(lng = -123.12, lat = 49.24, zoom = 11)
+```
+
+```{r viz9_fallback, eval=!requireNamespace("leaflet", quietly=TRUE)}
+cat("Install leaflet to see the interactive map:\n  install.packages('leaflet')\n")
+```

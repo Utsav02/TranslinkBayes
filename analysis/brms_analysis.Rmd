@@ -1,0 +1,540 @@
+---
+title: "TransLink Delay Propagation — brms Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      cache = TRUE, cache.lazy = FALSE)
+```
+
+# Setup
+
+```{r libs, cache=FALSE}
+library(brms)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(bayesplot)
+library(loo)
+library(patchwork)
+library(arrow)
+
+# parallel chains
+options(mc.cores = parallel::detectCores())
+```
+
+# Data
+
+Using the v2 parquet export (route 6641 direction 0, since 2026-05-09).
+Anomalous/sparse days are excluded automatically by the data_quality chunk below.
+
+```{r load}
+pq_path <- tail(
+  sort(list.files("../exports", pattern = "route6641_dir0_.*\\.parquet",
+                  full.names = TRUE)),
+  1
+)
+if (length(pq_path) == 0) stop("No route6641_dir0_*.parquet found in exports/")
+cat(sprintf("Loading: %s\n", pq_path))
+
+raw <- arrow::read_parquet(pq_path) %>%
+  filter(
+    !is.na(delay_seconds),
+    !is.na(previous_stop_delay),
+    !is.na(shape_dist_traveled),
+    !is.na(hour),
+    !is.na(stop_id),
+    !is.na(trip_id),
+    abs(delay_seconds)        <= 3600,
+    abs(previous_stop_delay)  <= 3600
+  ) %>%
+  mutate(
+    timestamp   = as.POSIXct(timestamp, tz = "UTC"),
+    date        = as.Date(timestamp),
+    hour        = as.integer(hour),
+    dow         = as.integer(wday(timestamp, week_start = 1L)),
+    trip_id     = as.character(trip_id),
+    stop_id     = as.character(stop_id)
+  )
+
+cat("Rows after NA + outlier filter:", nrow(raw), "\n")
+cat("Date range:", format(min(raw$date)), "→", format(max(raw$date)), "\n")
+cat("Unique trips:", n_distinct(raw$trip_id),
+    " | Unique stops:", n_distinct(raw$stop_id), "\n")
+```
+
+```{r data_quality, cache=FALSE}
+cat("=== Data Quality ===\n\n")
+
+n_before_anomaly <- nrow(raw)
+
+# NULL check — should all be 0 after filtering
+model_vars <- c("delay_seconds", "previous_stop_delay", "shape_dist_traveled",
+                "hour", "dow", "trip_id", "stop_id")
+null_rates <- sapply(model_vars, function(v) mean(is.na(raw[[v]])))
+if (any(null_rates > 0)) {
+  cat("WARN: Non-zero NULL rates after filtering:\n")
+  print(null_rates[null_rates > 0])
+} else {
+  cat("NULL check: all model variables clean (0% NULL)\n")
+}
+
+# Data-driven anomaly day detection (replaces hardcoded date exclusions)
+daily_stats <- raw %>%
+  group_by(date) %>%
+  summarise(n = n(), mean_delay = mean(delay_seconds, na.rm = TRUE), .groups = "drop")
+
+overall_mean <- mean(daily_stats$mean_delay)
+overall_sd   <- sd(daily_stats$mean_delay)
+
+anomaly_days <- daily_stats %>%
+  filter(n < 0.20 * median(daily_stats$n) |
+         abs(mean_delay - overall_mean) > 2 * overall_sd) %>%
+  pull(date)
+
+cat(sprintf("Anomaly days excluded: %s\n",
+            if (length(anomaly_days) > 0) paste(anomaly_days, collapse = ", ") else "none"))
+
+if (length(anomaly_days) > 0) {
+  raw <- raw %>% filter(!date %in% anomaly_days)
+  cat(sprintf("Rows: %s → %s  (lost %s)\n",
+              format(n_before_anomaly, big.mark = ","),
+              format(nrow(raw), big.mark = ","),
+              format(n_before_anomaly - nrow(raw), big.mark = ",")))
+}
+
+# Delay distribution summary
+delay_mean <- mean(raw$delay_seconds)
+delay_sd   <- sd(raw$delay_seconds)
+skew       <- mean(((raw$delay_seconds - delay_mean) / delay_sd)^3)
+cat(sprintf("\nDelay distribution: mean=%.1fs  SD=%.1fs  skewness=%.2f\n",
+            delay_mean, delay_sd, skew))
+cat(sprintf("Date range: %s → %s  (%d unique dates)\n",
+            min(raw$date), max(raw$date), n_distinct(raw$date)))
+```
+
+## Temporal split
+
+Train on the first 75 % of dates, hold out the last 25 %.
+This respects causal time — the model never sees future delays during training.
+
+```{r split, cache=FALSE}
+dates      <- sort(unique(raw$date))
+cutoff     <- dates[floor(0.75 * length(dates))]
+train_df   <- filter(raw, date <= cutoff)
+test_df    <- filter(raw, date >  cutoff)
+
+cat("Train:", nrow(train_df), "rows up to",   format(cutoff), "\n")
+cat("Test: ", nrow(test_df),  "rows from",
+    format(min(test_df$date)), "→", format(max(test_df$date)), "\n")
+stopifnot("Test set has < 100 rows — check data and split" = nrow(test_df) >= 100)
+```
+
+---
+
+# Priors
+
+One block shared across all models.
+Matches the original project but expressed in brms syntax.
+Note: brms' Student-t family (`nu`) defaults to `gamma(2, 0.1)` — we make
+it explicit and add `lb = 2` to match the hard floor in the original Stan code.
+
+```{r priors}
+base_priors <- c(
+  prior(normal(0, 2),       class = b),        # all regression coefs
+  prior(normal(0, 10),      class = Intercept), # global mean
+  prior(exponential(1),     class = sigma),     # residual scale
+  prior(exponential(1),     class = sd),        # random-effect scales
+  prior(gamma(2, 0.1),      class = nu, lb = 2) # Student-t df
+)
+```
+
+---
+
+# Model 0 — Baseline
+
+Equivalent to the original `delay_model_hier.stan`:
+previous delay + distance + hour (as factor) + dow (cyclic spline) + trip random effect.
+
+## Inspect Stan code first
+
+```{r m0_stancode}
+f_m0 <- bf(
+  delay_seconds ~ previous_stop_delay + shape_dist_traveled +
+    factor(hour) + s(dow, bs = "cc", k = 5) +
+    (1 | trip_id)
+)
+
+cat(make_stancode(f_m0, data = train_df, family = student(),
+                  prior = base_priors,
+                  knots = list(dow = c(0.5, 7.5))))
+```
+
+## Fit
+
+```{r m0_fit}
+m0 <- brm(
+  f_m0,
+  data    = train_df,
+  family  = student(),
+  prior   = base_priors,
+  knots   = list(dow = c(0.5, 7.5)),
+  iter    = 2000, warmup = 1000, chains = 4, seed = 42,
+  control = list(adapt_delta = 0.95),
+  file    = "models/brms_m0"
+)
+```
+
+## Diagnostics
+
+```{r m0_diag, fig.height=3}
+# Chain mixing for the parameters we care most about
+mcmc_trace(as.array(m0), pars = c("b_Intercept", "b_previous_stop_delay",
+                                   "b_shape_dist_traveled", "sigma", "nu"))
+```
+
+```{r m0_summary}
+summary(m0, pars = c("b_Intercept", "b_previous_stop_delay",
+                      "b_shape_dist_traveled", "sigma", "nu"))
+```
+
+```{r m0_ppc, fig.height=3}
+# Posterior predictive check using Stan's y_rep — correct multi-draw version
+pp_check(m0, ndraws = 50, type = "dens_overlay") +
+  coord_cartesian(xlim = c(-600, 600)) +
+  labs(title = "M0 PPC: 50 posterior predictive draws vs observed")
+```
+
+---
+
+# Model 1 — Cyclic spline for hour
+
+`factor(hour)` gives 24 independent, unsmoothed parameters.
+A cyclic cubic spline (`bs = "cc"`) reduces this to ~8 basis coefficients
+and forces the function to be smooth and periodic across midnight (hour 23 → 0).
+
+`knots = list(hour = c(0, 24))` tells mgcv the period is 24 hours.
+
+## Inspect Stan code first
+
+```{r m1_stancode}
+f_m1 <- bf(
+  delay_seconds ~ previous_stop_delay + shape_dist_traveled +
+    s(hour, bs = "cc", k = 8) +
+    s(dow, bs = "cc", k = 5) +
+    (1 | trip_id)
+)
+
+# brm() needs knots passed separately — inspect using make_stancode + make_standata
+stancode_m1 <- make_stancode(f_m1, data = train_df, family = student(),
+                              prior = base_priors,
+                              knots = list(hour = c(0, 24), dow = c(0.5, 7.5)))
+cat(stancode_m1)
+```
+
+Notice the spline basis matrix `Zs_` in the generated Stan data — brms
+pre-computes it and passes it as data, not parameters.
+
+## Fit
+
+```{r m1_fit}
+m1 <- brm(
+  f_m1,
+  data    = train_df,
+  family  = student(),
+  prior   = base_priors,
+  knots   = list(hour = c(0, 24), dow = c(0.5, 7.5)),
+  iter    = 2000, warmup = 1000, chains = 4, seed = 42,
+  control = list(adapt_delta = 0.95),
+  file    = "models/brms_m1"
+)
+```
+
+## Compare hour effects: factor vs spline
+
+```{r m1_hour_compare, fig.height=3}
+# M0: extract factor(hour) posterior means (reference level = hour 0, excluded from fixef)
+hour_m0 <- as.data.frame(fixef(m0)) %>%
+  tibble::rownames_to_column("term") %>%
+  filter(grepl("factorhour", term)) %>%
+  mutate(hour = as.integer(gsub("factorhour", "", term)))
+
+# M1: dow is now a numeric cyclic spline — no factor level issues.
+# Fix dow to Monday (1) and vary hour across its full range.
+hour_grid <- data.frame(
+  hour                = 0:23,
+  dow                 = 1L,
+  previous_stop_delay = 0,
+  shape_dist_traveled = mean(train_df$shape_dist_traveled),
+  trip_id             = train_df$trip_id[1]
+)
+f_vals    <- as.data.frame(fitted(m1, newdata = hour_grid,
+                                   re_formula = NA, allow_new_levels = TRUE))
+hour_m1_df <- dplyr::bind_cols(hour_grid, f_vals)
+
+p_m0_hour <- ggplot(hour_m0, aes(x = hour, y = Estimate)) +
+  geom_line(color = "steelblue") +
+  geom_ribbon(aes(ymin = `Q2.5`, ymax = `Q97.5`), alpha = 0.2, fill = "steelblue") +
+  labs(title = "M0: 24 independent hour effects", x = "Hour", y = "Predicted delay (s)") +
+  theme_minimal()
+
+p_m1_hour <- ggplot(hour_m1_df, aes(x = hour, y = Estimate)) +
+  geom_line(color = "coral") +
+  geom_ribbon(aes(ymin = Q2.5, ymax = Q97.5), alpha = 0.2, fill = "coral") +
+  labs(title = "M1: cyclic spline (8 basis fns, avg over dow)", x = "Hour", y = "Predicted delay (s)") +
+  theme_minimal()
+
+p_m0_hour + p_m1_hour
+```
+
+---
+
+# Model 2 — Extended: stop effects + cyclic hour
+
+Adds a stop-level random effect — the key improvement over M0 that was shown
+to win on LOO in the original project.
+
+## Inspect Stan code first
+
+```{r m2_stancode}
+f_m2 <- bf(
+  delay_seconds ~ previous_stop_delay + shape_dist_traveled +
+    s(hour, bs = "cc", k = 8) +
+    s(dow, bs = "cc", k = 5) +
+    (1 | trip_id) +
+    (1 | stop_id)
+)
+
+cat(make_stancode(f_m2, data = train_df, family = student(),
+                  prior = base_priors,
+                  knots = list(hour = c(0, 24), dow = c(0.5, 7.5))))
+```
+
+## Fit
+
+```{r m2_fit}
+m2 <- brm(
+  f_m2,
+  data    = train_df,
+  family  = student(),
+  prior   = base_priors,
+  knots   = list(hour = c(0, 24), dow = c(0.5, 7.5)),
+  iter    = 2000, warmup = 1000, chains = 4, seed = 42,
+  control = list(adapt_delta = 0.95),
+  file    = "models/brms_m2"
+)
+```
+
+```{r m2_ppc, fig.height=3}
+pp_check(m2, ndraws = 50, type = "dens_overlay") +
+  coord_cartesian(xlim = c(-600, 600)) +
+  labs(title = "M2 PPC")
+```
+
+---
+
+# LOO comparison
+
+```{r loo}
+m0 <- add_criterion(m0, "loo")
+m1 <- add_criterion(m1, "loo")
+m2 <- add_criterion(m2, "loo")
+
+loo_compare(m0, m1, m2)
+```
+
+---
+
+# Temporal holdout evaluation
+
+LOO is in-sample and assumes exchangeability. This evaluates on days
+the model never saw — the honest test.
+
+```{r temporal_eval}
+# dow is pre-factored with levels 1:7 in the data, so all levels are always present —
+# no factor dimension mismatch when brms rebuilds the design matrix for newdata.
+# brms handles unseen trip_id/stop_id with allow_new_levels = TRUE
+pred_m2 <- posterior_predict(m2, newdata = test_df,
+                              allow_new_levels = TRUE, ndraws = 500)
+
+# Point estimate: posterior mean of predictive distribution
+pred_mean <- colMeans(pred_m2)
+
+# 90 % predictive interval
+ci_lower <- apply(pred_m2, 2, quantile, 0.05)
+ci_upper <- apply(pred_m2, 2, quantile, 0.95)
+
+results <- test_df %>%
+  mutate(
+    predicted = pred_mean,
+    ci_lower  = ci_lower,
+    ci_upper  = ci_upper,
+    residual  = delay_seconds - predicted,
+    covered   = delay_seconds >= ci_lower & delay_seconds <= ci_upper
+  )
+
+cat(sprintf("MAE:       %.1f seconds\n", mean(abs(results$residual))))
+cat(sprintf("RMSE:      %.1f seconds\n", sqrt(mean(results$residual^2))))
+cat(sprintf("90%% Coverage: %.1f%%\n", 100 * mean(results$covered)))
+```
+
+```{r temporal_plots, fig.height=3}
+p_pred <- ggplot(results, aes(x = delay_seconds, y = predicted)) +
+  geom_point(alpha = 0.2, color = "steelblue") +
+  geom_abline(slope = 1, linetype = "dashed") +
+  labs(title = "Temporal holdout: observed vs predicted (M2)",
+       x = "Observed delay (s)", y = "Predicted delay (s)") +
+  theme_minimal()
+
+p_resid <- ggplot(results, aes(x = factor(hour), y = residual)) +
+  geom_boxplot(fill = "lightblue", outlier.alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals by hour", x = "Hour", y = "Residual (s)") +
+  theme_minimal()
+
+p_pred + p_resid
+```
+
+---
+
+# Model validation
+
+```{r model_checks, cache=FALSE}
+cat("=== Model Validation: M2 ===\n\n")
+
+# ── Convergence ──────────────────────────────────────────────────────────────
+smry     <- summary(m2)
+all_rhat <- c(smry$fixed[, "Rhat"], smry$spec_pars[, "Rhat"])
+all_ess  <- c(smry$fixed[, "Bulk_ESS"], smry$fixed[, "Tail_ESS"],
+              smry$spec_pars[, "Bulk_ESS"], smry$spec_pars[, "Tail_ESS"])
+rhat_max <- max(all_rhat, na.rm = TRUE)
+ess_min  <- min(all_ess,  na.rm = TRUE)
+
+np        <- bayesplot::nuts_params(m2)
+n_divs    <- sum(np$Value[np$Parameter == "divergent__"])
+post_draws <- (m2$fit@sim$iter - m2$fit@sim$warmup) * m2$fit@sim$chains
+div_pct   <- 100 * n_divs / post_draws
+
+cat(sprintf("Rhat max:          %.4f  %s\n",
+            rhat_max, ifelse(rhat_max > 1.05, "[WARN > 1.05]", "[OK]")))
+cat(sprintf("ESS min:           %d    %s\n",
+            as.integer(ess_min), ifelse(ess_min < 400, "[WARN < 400]", "[OK]")))
+cat(sprintf("Divergent draws:   %d / %d  (%.1f%%)  %s\n",
+            n_divs, post_draws, div_pct,
+            ifelse(div_pct > 2, "[WARN > 2%]", "[OK]")))
+
+# ── Posterior sanity checks ──────────────────────────────────────────────────
+fe           <- fixef(m2)
+b_prev_mean  <- fe["previous_stop_delay", "Estimate"]
+b_prev_q2.5  <- fe["previous_stop_delay", "Q2.5"]
+b_prev_q97.5 <- fe["previous_stop_delay", "Q97.5"]
+sigma_est    <- smry$spec_pars["sigma", "Estimate"]
+nu_est       <- smry$spec_pars["nu",    "Estimate"]
+nu_l95       <- smry$spec_pars["nu",    "l-95% CI"]
+
+cat(sprintf("\nb_prev_delay:      %.3f [%.3f, %.3f]  %s\n",
+            b_prev_mean, b_prev_q2.5, b_prev_q97.5,
+            ifelse(b_prev_mean < 0.8 | b_prev_mean > 1.2,
+                   "[WARN: outside [0.8, 1.2] — check data]", "[OK]")))
+cat(sprintf("sigma:             %.1fs   %s\n",
+            sigma_est,
+            ifelse(sigma_est < 5 | sigma_est > 200, "[WARN: outside [5, 200]s]", "[OK]")))
+cat(sprintf("nu:                %.2f  (l-95%% CI=%.2f)  %s\n",
+            nu_est, nu_l95,
+            ifelse(nu_l95 < 2.1, "[WARN: nu at lower bound — extremely heavy-tailed]",
+                   "[OK]")))
+
+# ── Holdout checks ───────────────────────────────────────────────────────────
+mae         <- mean(abs(results$residual))
+coverage_90 <- mean(results$covered)
+obs_mean    <- mean(test_df$delay_seconds)
+pred_mean   <- mean(results$predicted)
+
+cat(sprintf("\nMAE:               %.1fs  %s\n",
+            mae, ifelse(mae > 120, "[WARN > 120s]", "[OK]")))
+cat(sprintf("Coverage (90%%):    %.1f%%  %s\n",
+            100 * coverage_90,
+            ifelse(coverage_90 < 0.75 | coverage_90 > 0.95,
+                   "[WARN: outside [75%, 95%]]", "[OK]")))
+cat(sprintf("Obs mean: %.1fs  |  Pred mean: %.1fs  |  Gap: %.1fs  %s\n",
+            obs_mean, pred_mean, abs(obs_mean - pred_mean),
+            ifelse(abs(obs_mean - pred_mean) > 5, "[WARN > 5s gap]", "[OK]")))
+
+# ── Verdict ──────────────────────────────────────────────────────────────────
+n_flags <- sum(c(
+  rhat_max > 1.05, ess_min < 400, div_pct > 2,
+  b_prev_mean < 0.8 | b_prev_mean > 1.2,
+  sigma_est < 5 | sigma_est > 200,
+  nu_l95 < 2.1,
+  mae > 120,
+  coverage_90 < 0.75 | coverage_90 > 0.95
+))
+verdict <- if (n_flags == 0) "PASS" else if (n_flags <= 2) "WARN" else "FAIL"
+cat(sprintf("\n>>> Verdict: %s  (%d flag(s))\n", verdict, n_flags))
+```
+
+```{r run_tracker, cache=FALSE}
+source("run_tracker.R")
+track_run(
+  model      = m2,
+  train_df   = train_df,
+  test_df    = test_df,
+  results    = results,
+  model_file = "models/brms_m2.rds",
+  n_routes   = NA_integer_
+)
+```
+
+---
+
+# Prior predictive check (M2)
+
+Fit M2 with `sample_prior = "only"` to see what delays the model
+*expects before seeing any data*. If the prior implies impossible delays
+(e.g., buses arriving 10 hours early), priors need tightening.
+
+```{r prior_pc}
+m2_prior <- update(m2, sample_prior = "only",
+                   file = "models/brms_m2_prior_only")
+
+pp_check(m2_prior, ndraws = 50, type = "dens_overlay") +
+  coord_cartesian(xlim = c(-2000, 2000)) +
+  labs(title = "Prior predictive check: what does the model expect before seeing data?")
+```
+
+---
+
+# Notes: Multi-route model (when v2 data accumulates)
+
+Once several weeks of data are collected via the v2 pipeline, the next model
+adds a route-level grouping above trips. Trips on the same route share a
+common baseline; different routes can still differ.
+
+```{r multiRoute_preview, eval=FALSE}
+# Load multi-route parquet when ready:
+# df_multi <- arrow::read_parquet("../exports/all_routes_YYYY-MM-DD.parquet")
+
+f_m3 <- bf(
+  delay_seconds ~ previous_stop_delay + shape_dist_traveled +
+    s(hour, bs = "cc", k = 8) +
+    s(dow, bs = "cc", k = 5) +
+    (1 | route_id / trip_id) +   # nested: trips within routes
+    (1 | stop_id)
+)
+
+# Always inspect Stan code first
+cat(make_stancode(f_m3, data = df_multi, family = student(),
+                  prior = base_priors,
+                  knots = list(hour = c(0, 24), dow = c(0.5, 7.5))))
+
+# m3 <- brm(f_m3, data = df_multi, family = student(), prior = base_priors,
+#           knots = list(hour = c(0, 24), dow = c(0.5, 7.5)),
+#           iter = 2000, chains = 4, seed = 42,
+#           control = list(adapt_delta = 0.95),
+#           file = "models/brms_m3_multiRoute")
+```

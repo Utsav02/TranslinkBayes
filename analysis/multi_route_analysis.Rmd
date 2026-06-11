@@ -1,0 +1,580 @@
+---
+title: "TransLink Multi-Route Delay Analysis — M3"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      cache = TRUE, cache.lazy = FALSE)
+```
+
+# Setup
+
+```{r libs, cache=FALSE}
+library(brms)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(bayesplot)
+library(loo)
+library(arrow)
+library(tidyr)
+library(patchwork)
+
+options(mc.cores = parallel::detectCores())
+```
+
+# Data snapshot
+
+```{r load}
+pq_path <- tail(
+  sort(list.files("../exports", pattern = "all_routes_.*\\.parquet",
+                  full.names = TRUE)),
+  1
+)
+if (length(pq_path) == 0) stop("No all_routes_*.parquet found in exports/")
+cat(sprintf("Loading: %s\n", pq_path))
+
+raw <- arrow::read_parquet(pq_path) |>
+  filter(
+    route_id != "",
+    !is.na(delay_seconds),
+    !is.na(previous_stop_delay),
+    !is.na(shape_dist_traveled),
+    !is.na(hour),
+    !is.na(stop_id),
+    !is.na(trip_id),
+    abs(delay_seconds)        <= 3600,
+    abs(previous_stop_delay)  <= 3600
+  ) |>
+  mutate(
+    timestamp   = as.POSIXct(timestamp, tz = "UTC"),
+    date        = as.Date(timestamp),
+    hour        = as.integer(hour),
+    dow         = as.integer(wday(timestamp, week_start = 1L)),
+    trip_id     = as.character(trip_id),
+    stop_id     = as.character(stop_id),
+    route_id    = as.character(route_id)
+  )
+
+cat("=== Data snapshot ===\n")
+cat(sprintf("Date range:   %s → %s\n", min(raw$date), max(raw$date)))
+cat(sprintf("Total rows:   %s\n", format(nrow(raw), big.mark=",")))
+cat(sprintf("Routes:       %d\n", n_distinct(raw$route_id)))
+cat(sprintf("Trips:        %s\n", format(n_distinct(raw$trip_id), big.mark=",")))
+cat(sprintf("Stops:        %s\n", format(n_distinct(raw$stop_id), big.mark=",")))
+cat(sprintf("Mean delay:   %.1f s\n", mean(raw$delay_seconds, na.rm=TRUE)))
+```
+
+```{r data_quality, cache=FALSE}
+cat("=== Data Quality ===\n\n")
+
+n_before_anomaly <- nrow(raw)
+
+# NULL check — should all be 0 after filtering
+model_vars <- c("delay_seconds", "previous_stop_delay", "shape_dist_traveled",
+                "hour", "dow", "trip_id", "stop_id", "route_id")
+null_rates <- sapply(model_vars, function(v) mean(is.na(raw[[v]])))
+if (any(null_rates > 0)) {
+  cat("WARN: Non-zero NULL rates after filtering:\n")
+  print(null_rates[null_rates > 0])
+} else {
+  cat("NULL check: all model variables clean (0% NULL)\n")
+}
+
+# Data-driven anomaly day detection (replaces hardcoded date exclusions)
+daily_stats <- raw %>%
+  group_by(date) %>%
+  summarise(n = n(), mean_delay = mean(delay_seconds, na.rm = TRUE), .groups = "drop")
+
+overall_mean <- mean(daily_stats$mean_delay)
+overall_sd   <- sd(daily_stats$mean_delay)
+
+anomaly_days <- daily_stats %>%
+  filter(n < 0.20 * median(daily_stats$n) |
+         abs(mean_delay - overall_mean) > 2 * overall_sd) %>%
+  pull(date)
+
+cat(sprintf("Anomaly days excluded: %s\n",
+            if (length(anomaly_days) > 0) paste(anomaly_days, collapse = ", ") else "none"))
+
+if (length(anomaly_days) > 0) {
+  raw <- raw %>% filter(!date %in% anomaly_days)
+  cat(sprintf("Rows: %s → %s  (lost %s)\n",
+              format(n_before_anomaly, big.mark = ","),
+              format(nrow(raw), big.mark = ","),
+              format(n_before_anomaly - nrow(raw), big.mark = ",")))
+}
+
+# Delay distribution summary
+delay_mean <- mean(raw$delay_seconds)
+delay_sd   <- sd(raw$delay_seconds)
+skew       <- mean(((raw$delay_seconds - delay_mean) / delay_sd)^3)
+cat(sprintf("\nDelay distribution: mean=%.1fs  SD=%.1fs  skewness=%.2f\n",
+            delay_mean, delay_sd, skew))
+cat(sprintf("Date range: %s → %s  (%d unique dates)\n",
+            min(raw$date), max(raw$date), n_distinct(raw$date)))
+```
+
+## Filter to routes with sufficient data
+
+M3 needs enough observations per route to estimate route-level random effects.
+Require ≥ 500 rows; subsample 500 rows per route across the top 25 routes.
+
+```{r anomaly_routes, cache=FALSE}
+# Curated exclusion list.  Two distinct failure modes — do not conflate:
+#
+# (A) Stop-sequence tie artifacts: RT feed broadcasts multiple stops at the
+#     same stop_sequence number (branching/loop topology).  LAG()-based
+#     previous_stop_delay is incorrect at tie points.  Do NOT replace with a
+#     threshold-based auto-exclusion — the bad-trip distribution is continuous
+#     (0–98%), not bimodal.  Update when the diagnostic below flags a new
+#     route above ~60% with >= 50 trips.
+#     Identified via stop-sequence integrity analysis (2026-05-29):
+#       12940  98.5%   6700  88.1%   30055  63.6%   6702  60.6%
+#     6718 stays excluded despite appearing at 27.3% in recent processed_stops:
+#       only 11 trips in May-16+ window — historically 100% bad.  Coverage
+#       artifact.
+#
+# (B) Structural GTFS join failure (different root cause from A):
+#     6619 (Route 009 Broadway/Lougheed): 65.5% of stops lack
+#     shape_dist_traveled because whole route sections — the Lougheed Hwy
+#     extension eastbound (stops 901–908) and both termini — have no shape
+#     entry in gtfs_static.db.  The NULL pattern is geographic, not random.
+#     After pre-filtering on shape_dist, only the central Broadway corridor
+#     remains — a structurally biased, non-representative sample.  Excluded
+#     here so a future data-volume increase cannot silently re-admit it.
+anomaly_routes <- c("12940", "6700", "30055", "6702", "6718", "6619")
+
+# Holdout routes — excluded from training, used only for out-of-distribution
+# evaluation after fitting.  Chosen for benchmark value and geographic contrast:
+#   6641 (099 Broadway B-Line): the route used for all single-route hand-tuning
+#     (M0–M3 in brms_analysis.Rmd) — allows direct Ralph loop vs hand-built
+#     model comparison.
+#   6705 (321 King George Blvd): suburban Surrey route — geographic contrast
+#     to the urban B-Line tests generalization across route types.
+holdout_routes <- c("6641", "6705")
+
+# Diagnostic: print the full tied-sequence rate table so new candidates are
+# visible on every render.  Routes above ~60% with solid trip counts warrant
+# review for addition to anomaly_routes.
+report_seq_integrity <- function(df, min_trips = 10) {
+  trip_flags <- df |>
+    group_by(.data$route_id, .data$trip_id) |>
+    summarise(
+      has_tie = any(duplicated(.data$stop_sequence)),
+      .groups = "drop"
+    )
+
+  route_flags <- trip_flags |>
+    group_by(.data$route_id) |>
+    summarise(
+      total_trips = n(),
+      bad_trips   = sum(.data$has_tie),
+      pct_bad     = round(100 * mean(.data$has_tie), 1),
+      .groups     = "drop"
+    ) |>
+    filter(.data$total_trips >= min_trips) |>
+    arrange(desc(.data$pct_bad))
+
+  cat("Stop-sequence tie rates by route (routes with >= 10 trips):\n")
+  cat(sprintf("  %-10s  %10s  %9s  %7s  %s\n",
+              "route_id", "total_trips", "bad_trips", "pct_bad", "excluded"))
+  for (i in seq_len(nrow(route_flags))) {
+    r <- route_flags[i, ]
+    excl <- if (r$route_id %in% anomaly_routes) "<-- EXCLUDED" else ""
+    cat(sprintf("  %-10s  %10d  %9d  %6.1f%%  %s\n",
+                r$route_id, r$total_trips, r$bad_trips, r$pct_bad, excl))
+  }
+
+  invisible(route_flags)
+}
+
+report_seq_integrity(raw)
+cat(sprintf("\nExcluding %d route(s): %s\n",
+            length(anomaly_routes), paste(anomaly_routes, collapse = ", ")))
+```
+
+```{r subsample}
+set.seed(42)
+
+holdout_df <- raw |>
+  filter(route_id %in% holdout_routes)
+cat(sprintf(
+  "Holdout set: %s rows across %d routes (%s)\n",
+  format(nrow(holdout_df), big.mark = ","),
+  n_distinct(holdout_df$route_id),
+  paste(sort(unique(holdout_df$route_id)), collapse = ", ")
+))
+
+route_counts <- raw |>
+  filter(!route_id %in% anomaly_routes, !route_id %in% holdout_routes) |>
+  count(route_id, name = "n_rows") |>
+  filter(n_rows >= 500) |>
+  arrange(desc(n_rows))
+
+cat(sprintf("Routes with ≥500 rows (excl. %d anomaly routes): %d\n",
+            length(anomaly_routes), nrow(route_counts)))
+
+# Log routes on the edge of the 500-row threshold (±100 rows)
+edge_routes <- raw |>
+  filter(!route_id %in% anomaly_routes, !route_id %in% holdout_routes) |>
+  count(route_id) |>
+  filter(n >= 400 & n < 600) |>
+  arrange(n)
+if (nrow(edge_routes) > 0) {
+  cat(sprintf("Routes near ≥500 threshold (400–599 rows): %s\n",
+              paste(sprintf("%s(%d)", edge_routes$route_id, edge_routes$n), collapse = ", ")))
+}
+
+# Top 25 routes × 500 rows = ~12,500 rows.
+# Gives ~15 trips per route to estimate route-level random effects vs ~4 at 150 rows.
+top_routes <- route_counts |> slice_max(n_rows, n = 25)
+
+df <- raw |>
+  filter(route_id %in% top_routes$route_id) |>
+  group_by(route_id) |>
+  slice_sample(n = 500) |>
+  ungroup()
+
+cat(sprintf("After 500-row-per-route subsample (top 25): %s rows, %d routes\n",
+            format(nrow(df), big.mark = ","), n_distinct(df$route_id)))
+```
+
+## Temporal split
+
+```{r split, cache=FALSE}
+dates    <- sort(unique(df$date))
+cutoff   <- dates[floor(0.75 * length(dates))]
+train_df <- filter(df, date <= cutoff)
+test_df  <- filter(df, date >  cutoff)
+
+cat(sprintf("Train: %s rows up to %s\n", format(nrow(train_df), big.mark=","), cutoff))
+cat(sprintf("Test:  %s rows from %s → %s\n",
+            format(nrow(test_df), big.mark=","), min(test_df$date), max(test_df$date)))
+```
+
+---
+
+# Priors
+
+```{r priors}
+base_priors <- c(
+  prior(normal(0, 2),       class = b),
+  prior(normal(0, 10),      class = Intercept),
+  prior(exponential(1),     class = sigma),
+  prior(exponential(1),     class = sd),
+  prior(gamma(2, 0.1),      class = nu, lb = 2)
+)
+```
+
+---
+
+# M3 — Multi-route nested model
+
+Route-level random intercepts: `(1 | route_id)`.
+Routes share the same `previous_stop_delay` slope — the key question is whether
+the intercepts vary systematically across routes.
+
+## Inspect Stan code
+
+```{r m3_stancode}
+f_m3 <- bf(
+  delay_seconds ~ previous_stop_delay + shape_dist_traveled +
+    s(hour, bs = "cc", k = 8) +
+    s(dow,  bs = "cc", k = 5) +
+    (1 | route_id) +
+    (1 | trip_id) +
+    (1 | stop_id)
+)
+
+cat(make_stancode(f_m3, data = train_df, family = student(),
+                  prior = base_priors,
+                  knots = list(hour = c(0, 24), dow = c(0.5, 7.5))))
+```
+
+## Fit
+
+```{r m3_fit}
+m3 <- brm(
+  f_m3,
+  data    = train_df,
+  family  = student(),
+  prior   = base_priors,
+  knots   = list(hour = c(0, 24), dow = c(0.5, 7.5)),
+  iter    = 2000, warmup = 1000, chains = 4, seed = 42,
+  control = list(adapt_delta = 0.95),
+  file    = "models/brms_m3_multiRoute",
+  refresh = 50
+)
+```
+
+## Summary
+
+```{r m3_summary}
+summary(m3, pars = c("b_Intercept", "b_previous_stop_delay",
+                      "b_shape_dist_traveled", "sigma", "nu"))
+```
+
+## Diagnostics
+
+```{r m3_diag, fig.height=3}
+mcmc_trace(as.array(m3), pars = c("b_Intercept", "b_previous_stop_delay",
+                                    "b_shape_dist_traveled", "sigma", "nu"))
+```
+
+```{r m3_ppc, fig.height=3}
+pp_check(m3, ndraws = 50, type = "dens_overlay") +
+  coord_cartesian(xlim = c(-600, 600)) +
+  labs(title = "M3 PPC: 50 posterior predictive draws vs observed")
+```
+
+---
+
+# Route-level random effects
+
+Which routes are systematically delayed or ahead of schedule,
+after accounting for delay propagation, distance, hour, and day of week?
+
+```{r route_effects, fig.height=10}
+re <- ranef(m3)$route_id %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("route_id") %>%
+  rename(Estimate = Estimate.Intercept,
+         Q2.5     = Q2.5.Intercept,
+         Q97.5    = Q97.5.Intercept) %>%
+  arrange(Estimate)
+
+# Attach row counts
+re <- re %>%
+  left_join(route_counts %>% select(route_id, n_rows), by = "route_id")
+
+ggplot(re, aes(x = Estimate, y = reorder(route_id, Estimate))) +
+  geom_point(aes(size = n_rows), color = "steelblue") +
+  geom_errorbarh(aes(xmin = Q2.5, xmax = Q97.5), height = 0.3, alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_size_continuous(name = "obs in period", range = c(1, 4)) +
+  labs(title = "Route-level random intercepts (M3)",
+       subtitle = "Positive = systematically later than average; Negative = systematically earlier",
+       x = "Effect (seconds)", y = "Route ID") +
+  theme_minimal(base_size = 9)
+```
+
+## Distribution of route effects
+
+```{r route_dist, fig.height=3}
+ggplot(re, aes(x = Estimate)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Distribution of route-level intercepts",
+       x = "Effect (seconds)", y = "Count") +
+  theme_minimal()
+```
+
+---
+
+# Temporal holdout
+
+```{r m3_holdout}
+pred_m3 <- posterior_predict(m3, newdata = test_df,
+                              allow_new_levels = TRUE, ndraws = 500)
+
+pred_mean <- colMeans(pred_m3)
+ci_lower  <- apply(pred_m3, 2, quantile, 0.05)
+ci_upper  <- apply(pred_m3, 2, quantile, 0.95)
+
+results <- test_df %>%
+  mutate(
+    predicted = pred_mean,
+    ci_lower  = ci_lower,
+    ci_upper  = ci_upper,
+    residual  = delay_seconds - predicted,
+    covered   = delay_seconds >= ci_lower & delay_seconds <= ci_upper
+  )
+
+cat(sprintf("MAE:          %.1f seconds\n", mean(abs(results$residual))))
+cat(sprintf("RMSE:         %.1f seconds\n", sqrt(mean(results$residual^2))))
+cat(sprintf("90%% Coverage: %.1f%%\n",  100 * mean(results$covered)))
+```
+
+```{r m3_holdout_plots, fig.height=3}
+p_pred <- ggplot(results, aes(x = delay_seconds, y = predicted)) +
+  geom_point(alpha = 0.1, color = "steelblue") +
+  geom_abline(slope = 1, linetype = "dashed") +
+  labs(title = "Temporal holdout: observed vs predicted (M3)",
+       x = "Observed delay (s)", y = "Predicted delay (s)") +
+  theme_minimal()
+
+p_resid <- ggplot(results, aes(x = factor(hour), y = residual)) +
+  geom_boxplot(fill = "lightblue", outlier.alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals by hour", x = "Hour", y = "Residual (s)") +
+  theme_minimal()
+
+p_pred + p_resid
+```
+
+---
+
+# Route holdout evaluation
+
+Routes 6641 (099 Broadway B-Line) and 6705 (321 King George Blvd) were never
+seen during training. This is the primary generalization test — not a temporal
+slice of training routes, but entirely unseen routes. Route 6641 also allows
+direct comparison against the hand-built M0–M3 single-route models.
+
+```{r m3_holdout_routes}
+pred_holdout <- posterior_predict(
+  m3, newdata = holdout_df,
+  allow_new_levels = TRUE, ndraws = 500
+)
+
+holdout_results <- holdout_df |>
+  mutate(
+    predicted = colMeans(pred_holdout),
+    ci_lower  = apply(pred_holdout, 2, quantile, 0.05),
+    ci_upper  = apply(pred_holdout, 2, quantile, 0.95),
+    residual  = delay_seconds - predicted,
+    covered   = delay_seconds >= ci_lower & delay_seconds <= ci_upper
+  )
+
+for (r in sort(unique(holdout_results$route_id))) {
+  rd <- filter(holdout_results, route_id == r)
+  cat(sprintf(
+    "Route %-6s  MAE=%.1fs  RMSE=%.1fs  90%%CI=%.1f%%  rows=%d\n",
+    r,
+    mean(abs(rd$residual)),
+    sqrt(mean(rd$residual^2)),
+    100 * mean(rd$covered),
+    nrow(rd)
+  ))
+}
+
+cat(sprintf(
+  "\nOverall  MAE=%.1fs  RMSE=%.1fs  90%%CI=%.1f%%\n",
+  mean(abs(holdout_results$residual)),
+  sqrt(mean(holdout_results$residual^2)),
+  100 * mean(holdout_results$covered)
+))
+```
+
+```{r m3_holdout_routes_plot, fig.height=3}
+ggplot(holdout_results, aes(x = delay_seconds, y = predicted,
+                             colour = route_id)) +
+  geom_point(alpha = 0.15) +
+  geom_abline(slope = 1, linetype = "dashed") +
+  scale_colour_brewer(palette = "Set1", name = "Route") +
+  labs(title = "Route holdout: observed vs predicted (M3)",
+       subtitle = "Routes 6641 and 6705 — never seen during training",
+       x = "Observed delay (s)", y = "Predicted delay (s)") +
+  theme_minimal()
+```
+
+---
+
+# Model validation
+
+```{r model_checks, cache=FALSE}
+cat("=== Model Validation: M3 ===\n\n")
+
+# ── Convergence ──────────────────────────────────────────────────────────────
+smry      <- summary(m3)
+re_all    <- do.call(rbind, smry$random)   # combines route_id, trip_id, stop_id
+all_rhat  <- c(smry$fixed[, "Rhat"], smry$spec_pars[, "Rhat"],
+               re_all[, "Rhat"])
+all_ess   <- c(smry$fixed[, "Bulk_ESS"], smry$fixed[, "Tail_ESS"],
+               smry$spec_pars[, "Bulk_ESS"], smry$spec_pars[, "Tail_ESS"],
+               re_all[, "Bulk_ESS"], re_all[, "Tail_ESS"])
+rhat_max  <- max(all_rhat, na.rm = TRUE)
+ess_min   <- min(all_ess,  na.rm = TRUE)
+
+np         <- bayesplot::nuts_params(m3)
+n_divs     <- sum(np$Value[np$Parameter == "divergent__"])
+post_draws <- (m3$fit@sim$iter - m3$fit@sim$warmup) * m3$fit@sim$chains
+div_pct    <- 100 * n_divs / post_draws
+
+cat(sprintf("Rhat max:          %.4f  %s\n",
+            rhat_max, ifelse(rhat_max > 1.05, "[WARN > 1.05]", "[OK]")))
+cat(sprintf("ESS min:           %d    %s\n",
+            as.integer(ess_min), ifelse(ess_min < 400, "[WARN < 400]", "[OK]")))
+cat(sprintf("Divergent draws:   %d / %d  (%.1f%%)  %s\n",
+            n_divs, post_draws, div_pct,
+            ifelse(div_pct > 2, "[WARN > 2%]", "[OK]")))
+
+# ── Posterior sanity checks ──────────────────────────────────────────────────
+fe           <- fixef(m3)
+b_prev_mean  <- fe["previous_stop_delay", "Estimate"]
+b_prev_q2.5  <- fe["previous_stop_delay", "Q2.5"]
+b_prev_q97.5 <- fe["previous_stop_delay", "Q97.5"]
+sigma_est    <- smry$spec_pars["sigma", "Estimate"]
+nu_est       <- smry$spec_pars["nu",    "Estimate"]
+nu_l95       <- smry$spec_pars["nu",    "l-95% CI"]
+route_sd     <- smry$random$route_id["sd(Intercept)", "Estimate"]
+route_sd_l95 <- smry$random$route_id["sd(Intercept)", "l-95% CI"]
+trip_sd      <- smry$random$trip_id["sd(Intercept)",  "Estimate"]
+stop_sd      <- smry$random$stop_id["sd(Intercept)",  "Estimate"]
+
+cat(sprintf("\nb_prev_delay:      %.3f [%.3f, %.3f]  %s\n",
+            b_prev_mean, b_prev_q2.5, b_prev_q97.5,
+            ifelse(b_prev_mean < 0.8 | b_prev_mean > 1.2,
+                   "[WARN: outside [0.8, 1.2] — check data]", "[OK]")))
+cat(sprintf("sigma:             %.1fs   %s\n",
+            sigma_est,
+            ifelse(sigma_est < 5 | sigma_est > 200, "[WARN: outside [5, 200]s]", "[OK]")))
+cat(sprintf("nu:                %.2f  (l-95%% CI=%.2f)  %s\n",
+            nu_est, nu_l95,
+            ifelse(nu_l95 < 2.1, "[WARN: nu at lower bound — extremely heavy-tailed]",
+                   "[OK]")))
+cat(sprintf("Route SD:          %.1fs  (l-95%% CI=%.1fs)  %s\n",
+            route_sd, route_sd_l95,
+            ifelse(route_sd_l95 < 0.5,
+                   "[WARN: route SD near zero — no detectable route variation]", "[OK]")))
+cat(sprintf("Trip SD:           %.1fs\n", trip_sd))
+cat(sprintf("Stop SD:           %.1fs\n", stop_sd))
+
+# ── Holdout checks ───────────────────────────────────────────────────────────
+mae         <- mean(abs(results$residual))
+coverage_90 <- mean(results$covered)
+obs_mean    <- mean(test_df$delay_seconds)
+pred_mean   <- mean(results$predicted)
+
+cat(sprintf("\nMAE:               %.1fs  %s\n",
+            mae, ifelse(mae > 150, "[WARN > 150s (multi-route threshold)]", "[OK]")))
+cat(sprintf("Coverage (90%%):    %.1f%%  %s\n",
+            100 * coverage_90,
+            ifelse(coverage_90 < 0.75 | coverage_90 > 0.95,
+                   "[WARN: outside [75%, 95%]]", "[OK]")))
+cat(sprintf("Obs mean: %.1fs  |  Pred mean: %.1fs  |  Gap: %.1fs  %s\n",
+            obs_mean, pred_mean, abs(obs_mean - pred_mean),
+            ifelse(abs(obs_mean - pred_mean) > 5, "[WARN > 5s gap]", "[OK]")))
+
+# ── Verdict ──────────────────────────────────────────────────────────────────
+n_flags <- sum(c(
+  rhat_max > 1.05, ess_min < 400, div_pct > 2,
+  b_prev_mean < 0.8 | b_prev_mean > 1.2,
+  sigma_est < 5 | sigma_est > 200,
+  nu_l95 < 2.1,
+  route_sd_l95 < 0.5,
+  mae > 150,
+  coverage_90 < 0.75 | coverage_90 > 0.95
+))
+# trip_sd and stop_sd are informational — not flagged, but tracked in run_tracker
+verdict <- if (n_flags == 0) "PASS" else if (n_flags <= 2) "WARN" else "FAIL"
+cat(sprintf("\n>>> Verdict: %s  (%d flag(s))\n", verdict, n_flags))
+```
+
+```{r run_tracker, cache=FALSE}
+source("run_tracker.R")
+track_run(
+  model      = m3,
+  train_df   = train_df,
+  test_df    = test_df,
+  results    = results,
+  model_file = "models/brms_m3_multiRoute.rds",
+  n_routes   = n_distinct(train_df$route_id)
+)
+```
