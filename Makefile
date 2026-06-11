@@ -39,7 +39,7 @@ refresh-render: ## full refresh, then re-render the Rmds
 	bash pipeline/refresh_analysis.sh --rerender
 
 dashboard: ## launch the Streamlit dashboard
-	$(PY) -m streamlit run pipeline/dashboard.py
+	$(PY) -m streamlit run pipeline/dashboard/app.py
 
 render: ## render all three Rmds (uses renv via .Rprofile)
 	cd analysis && Rscript -e "rmarkdown::render('brms_analysis.Rmd')"
