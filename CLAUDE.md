@@ -13,6 +13,7 @@ Part of the Post-Uni Projects workspace. See `../PROJECTS.md` for the full proje
 
 ```
 pipeline/          Python collection + processing scripts
+tests/             pure-logic smoke tests — `make test`, no DB needed
 analysis/          R Markdown analysis files
   models/          Fitted brms .rds files (gitignored — large binaries)
 docs/              schema.md (DB tables), known_baseline.md
@@ -29,7 +30,9 @@ venv/              Python 3.12 venv (gitignored — re-create with requirements.
 
 ### Python pipeline
 Common invocations are wrapped in the `Makefile` (`make help` lists targets:
-`process`, `quality`, `export`, `refresh`, `dashboard`, `render`, …).
+`test`, `process`, `quality`, `export`, `refresh`, `dashboard`, `render`, …).
+CI (`.github/workflows/ci.yml`) runs install + syntax check + `pytest tests/`
+on every push; R/renv is deliberately excluded from CI as too heavy.
 Always call the venv Python directly — `source activate` does not persist in bash subprocesses:
 ```bash
 venv/bin/python3 pipeline/quality_report.py --since 2026-05-09
