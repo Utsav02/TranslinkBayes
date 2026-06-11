@@ -1,0 +1,25 @@
+# Python-only CI: install pinned deps, syntax-check, run smoke tests.
+# R/renv is deliberately not exercised here — restoring renv + fitting brms
+# is far too heavy for CI; the R side is validated locally via `make render`.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install pinned requirements
+        run: pip install -r requirements.txt
+      - name: Syntax check
+        run: python -m compileall pipeline tests -q
+      - name: Smoke tests
+        run: python -m pytest tests/ -q
