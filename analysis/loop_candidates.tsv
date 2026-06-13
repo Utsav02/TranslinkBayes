@@ -1,0 +1,18 @@
+# Pre-registered model-search candidate queue (v1, 2026-06-12).
+# Authoritative prose + formulas: docs/model_loop_spec.md §4. This file is the
+# MACHINE-READABLE order the loop walks. A candidate is "done" iff run_log.csv
+# has a row whose model_file column contains its id (e.g. "...fit_candidate_C2...").
+# The loop fits the LOWEST-numbered id with no run_log row. STOP when none remain
+# or after 3 consecutive G4 non-passes (model_loop_spec.md §3).
+#
+# id	fit_script (analysis/)	one_line_hypothesis
+C0	fit_candidate_C0.R	baseline m3 at adapt_delta=0.99 — clean-converging reference (G2: zero divergences)
+C1	fit_candidate_C1.R	settled-rows-only TRAIN — does b_prev fall well below 1 (feed carry-forward validity probe)
+C2	fit_candidate_C2.R	+ log(headway_obs/headway_sched) — bunching amplifies delay beyond carry-forward
+C3	fit_candidate_C3.R	+ timepoint*previous_stop_delay — propagation resets at scheduled timepoints
+C4	fit_candidate_C4.R	s(shape_dist_traveled) replaces linear — non-linear delay accumulation along route
+C5	fit_candidate_C5.R	+ (1+previous_stop_delay|route_id) random slopes — propagation strength varies by route
+C6	fit_candidate_C6.R	+ ar(stop_sequence, gr=trip_serv_id, p=1) — residual serial correlation along trip
+C7	fit_candidate_C7.R	+ precip_mm + temp_c (ECCC) — weather adds signal beyond schedule features
+C8	fit_candidate_C8.R	top-50 routes x 2000 rows — subsampling, not structure, is the binding constraint
+C9	fit_candidate_C9.R	sigma ~ is_rush_hour + s(hour) — time-varying residual scale (calibration gains)

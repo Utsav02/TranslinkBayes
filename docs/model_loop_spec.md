@@ -201,6 +201,39 @@ acquisition unless the candidate explicitly lists it (C7 weather, and only from
 the already-materialized `exports/weather_hourly.parquet`); no prior tightening
 to chase convergence without logging it as a deviation.
 
+### 3.1 Running it — sleep-proof launcher (built 2026-06-13)
+
+The fit died twice from system sleep; every long run must hold a system-sleep
+assertion and be detached from the terminal. Two committed scripts do this:
+
+- `scripts/sleepproof_run.sh <logfile> <cmd...>` — wraps any command in
+  `caffeinate -s` (system-sleep assertion, survives a closed lid on AC) +
+  `nohup … & disown` (immune to SIGHUP). Prints the detached PID. Warns if not
+  on AC (where `caffeinate -s` is a no-op).
+- `scripts/run_loop_iteration.sh [--dry-run]` — runs ONE iteration: (1) verifies
+  `loop_train/test.parquet` against `loop_split_manifest.txt` and ABORTS on
+  drift; (2) resolves the lowest-numbered candidate in
+  `analysis/loop_candidates.tsv` with no `run_log.csv` row; (3) requires
+  `analysis/fit_candidate_<ID>.R`; (4) launches it sleep-proof + detached;
+  (5) verifies liveness (process alive, assertion held, log past iter 50 — the
+  point earlier fits died). `--dry-run` resolves the next candidate and proves
+  the plumbing without fitting.
+
+**Authoring a candidate (the loop agent's per-iteration job):** copy
+`analysis/fit_candidate_TEMPLATE.R` to `analysis/fit_candidate_<ID>.R` and edit
+only the three marked blocks (id, optional data prep, formula + adapt_delta).
+The template already reads the frozen parquets, applies shared priors/sampler
+settings, evaluates held-out ELPD (saving pointwise log-lik for ΔELPD±SE),
+RMSE, and coverage, and appends the `run_log.csv` row via `run_tracker.R`. It
+sets `file_refit="always"` so a cached `.rds` is never silently reloaded
+(baseline_registry caveat #1).
+
+**Starting the Ralph /loop:** point the loop at the per-iteration prompt below;
+each iteration the agent (a) authors the next `fit_candidate_<ID>.R` from the
+template, then (b) runs `scripts/run_loop_iteration.sh`. Cadence generous
+(one fit per session / ~hours). The launcher's hash check + the
+"never regenerate parquets" rule (§3) are the guardrails.
+
 ## 4. Pre-registered candidate queue (v1, 2026-06-12)
 
 Each entry is a **hypothesis, not a foregone conclusion**. Formulas modify the
