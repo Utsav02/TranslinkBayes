@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -113,22 +114,42 @@ def _extract_to_snapshot(content: bytes) -> Path:
     return dest
 
 
-def _archive_active() -> None:
-    """Moves data/gtfs_static/ into data/static_archive/GTFS_YYYY-MM-DD/."""
+def _archive_active() -> Path | None:
+    """Moves data/gtfs_static/ into data/static_archive/ and returns the dest."""
     if not ACTIVE_DIR.exists():
-        return
+        return None
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     dest = ARCHIVE_DIR / f"GTFS_{date.today().isoformat()}"
+    if dest.exists():
+        # Same-day re-run: shutil.move would nest ACTIVE_DIR inside dest
+        dest = ARCHIVE_DIR / f"GTFS_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
     shutil.move(str(ACTIVE_DIR), dest)
-    ACTIVE_DIR.mkdir()
     logging.info("Archived active GTFS → %s", dest)
+    return dest
 
 
 def _promote_snapshot(snapshot: Path) -> None:
-    """Copies snapshot files into data/gtfs_static/."""
-    ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
+    """Replaces data/gtfs_static/ with the snapshot via an atomic rename.
+
+    The slow file-by-file copy goes into a sibling staging dir first, so the
+    active dir is only ever swapped whole — never left half-populated. If the
+    swap fails after archiving, the archived dir is restored.
+    """
+    staging = ACTIVE_DIR.with_name(ACTIVE_DIR.name + ".staging")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
     for f in snapshot.iterdir():
-        shutil.copy2(f, ACTIVE_DIR / f.name)
+        shutil.copy2(f, staging / f.name)
+
+    archived = _archive_active()
+    try:
+        os.rename(staging, ACTIVE_DIR)
+    except OSError:
+        if archived is not None:
+            logging.error("Promote failed — restoring %s → %s", archived, ACTIVE_DIR)
+            shutil.move(str(archived), str(ACTIVE_DIR))
+        raise
     logging.info("Promoted %s → %s", snapshot, ACTIVE_DIR)
 
 
@@ -177,7 +198,6 @@ def sync(force: bool = False) -> bool:
         logging.info("Changed files: %s", changed_files)
         print(f"Changes detected in: {', '.join(changed_files)}")
 
-    _archive_active()
     _promote_snapshot(snapshot)
     _run_process_static()
 

@@ -15,7 +15,11 @@ ACTIVE_DIR = ROOT / "data" / "gtfs_static"
 # ── Minimum row counts — guard against corrupt/empty downloads ───────────────
 # Calibrated against TransLink's actual schedule size. If these fire on a
 # legitimate update, raise the constants — don't lower them without investigation.
-_MIN_STOPS      = 10_000
+# 2026-06-11: stops recalibrated 10,000 → 8,000. The feed genuinely carries
+# ~8.9k stops (8,952 / 8,955 / 8,919 across the 2026-05-23..06-06 snapshots,
+# confirmed by a fresh complete download), so the 10,000 floor blocked every
+# legitimate update.
+_MIN_STOPS      =  8_000
 _MIN_STOP_TIMES = 500_000
 _MIN_TRIPS      =  5_000
 _MIN_ROUTES     =    100
