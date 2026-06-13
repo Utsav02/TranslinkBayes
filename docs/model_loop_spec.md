@@ -227,6 +227,13 @@ expensive ones. **FIFA regime candidates are explicitly deferred to a v2
 queue** with a new frozen split once match days exist in both train and test
 (earliest ~mid-July).
 
+**Note on C1 and the snapshot log:** an append-only `stop_delays_snapshots`
+table now captures the full prediction trajectory, but only **from 2026-06-12**
+— it does *not* cover this loop's frozen window (06-08…06-11). So C1 here still
+uses the settled-row heuristic (`final fetch ≥ predicted arrival`) computed on
+`stop_delays`. The snapshot log's true fixed-horizon evaluation becomes
+available to the **v2 / FIFA-phase** loop, whose window post-dates 06-12.
+
 ## 5. Owner decisions — RESOLVED 2026-06-12
 
 1. **Frozen split — APPROVED**, with the FIFA correction applied: train ≤

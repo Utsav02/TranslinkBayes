@@ -31,6 +31,34 @@ CREATE INDEX IF NOT EXISTS idx_sd_route    ON stop_delays (route_id);
 CREATE INDEX IF NOT EXISTS idx_sd_trip     ON stop_delays (trip_id);
 CREATE INDEX IF NOT EXISTS idx_sd_ts       ON stop_delays (timestamp);
 
+-- Append-only prediction-snapshot log (added 2026-06-12, pre-FIFA).
+-- stop_delays UPSERTS — it keeps only the LAST snapshot per (trip,stop,date),
+-- so the prediction trajectory (and the post-arrival "settled" value vs an
+-- early forecast) is overwritten and unrecoverable. This table keeps EVERY
+-- 5-minute snapshot, so fixed-horizon evaluation and the C1 validity probe
+-- (docs/model_loop_spec.md) are possible on FIFA-window data.
+--   * Purely additive: no existing table or consumer is touched.
+--   * timestamp is in the PK, so each fetch appends rather than overwrites.
+--   * Growth ≈ 4.6× stop_delays (~3M rows/dense day, ~100M over the FIFA
+--     window). See docs note on retention if disk becomes a concern.
+CREATE TABLE IF NOT EXISTS stop_delays_snapshots (
+    trip_id                TEXT,
+    route_id               TEXT,
+    stop_id                TEXT,
+    stop_sequence          INTEGER,
+    actual_arrival         TEXT,
+    actual_arrival_pacific TEXT,
+    delay_seconds          INTEGER,
+    bus_id                 TEXT,
+    timestamp              TEXT,
+    service_date           TEXT,
+    PRIMARY KEY (trip_id, stop_id, service_date, timestamp)
+);
+
+CREATE INDEX IF NOT EXISTS idx_snap_traj  ON stop_delays_snapshots (trip_id, stop_id, service_date);
+CREATE INDEX IF NOT EXISTS idx_snap_route ON stop_delays_snapshots (route_id);
+CREATE INDEX IF NOT EXISTS idx_snap_svc   ON stop_delays_snapshots (service_date);
+
 CREATE TABLE IF NOT EXISTS realtime_vehicle_positions (
     timestamp     TEXT,
     route_id      TEXT,

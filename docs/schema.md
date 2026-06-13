@@ -111,7 +111,36 @@ Raw arrival observations from the GTFS-RT trip updates feed.
 | timestamp | TEXT | DEFAULT CURRENT_TIMESTAMP; indexed (`idx_sd_ts`) |
 
 PK `(trip_id, stop_id, service_date)` makes re-collection idempotent — the same
-trip/stop/day observation upserts rather than duplicates.
+trip/stop/day observation upserts rather than duplicates. **Because it upserts,
+this table keeps only the LAST snapshot of each prediction** — the trajectory
+and the early-vs-settled distinction are overwritten. See `stop_delays_snapshots`.
+
+### stop_delays_snapshots (append-only; populated from 2026-06-12 23:30 UTC)
+
+Immutable log of **every** 5-minute feed snapshot, added before the FIFA window
+so the full prediction trajectory (and the post-arrival settled value vs an
+early forecast) is recoverable — `stop_delays`'s upsert discards it. Written
+best-effort by `collect_realtime_v2.py` after the `stop_delays` upsert; a
+failure here cannot affect the primary table. Same columns as `stop_delays`,
+but `timestamp` is part of the PK so each fetch appends.
+
+| Column | Type | Notes |
+|---|---|---|
+| trip_id, stop_id, service_date | TEXT | PK part |
+| timestamp | TEXT | PK part — per-row UTC ISO w/ microseconds; each fetch is distinct |
+| route_id | TEXT | indexed (`idx_snap_route`) |
+| stop_sequence, delay_seconds | INTEGER | |
+| actual_arrival, actual_arrival_pacific, bus_id | TEXT | |
+
+Indexes: `idx_snap_traj (trip_id, stop_id, service_date)` for trajectory
+reconstruction, `idx_snap_route`, `idx_snap_svc (service_date)`.
+
+⚠ **Growth**: ≈ 4.6× `stop_delays` (~3M rows/dense day, ~100M over the FIFA
+window). No data here before 2026-06-12 — it does **not** cover the current
+loop's frozen test window (06-08…06-11); it serves the FIFA phase-2 analysis.
+Retention (if disk pressures): snapshots for a fully-settled past
+`service_date` can be down-sampled to change-points without losing the
+piecewise-constant trajectory — a future prune job, not currently run.
 
 ### processed_stops (~3.0M rows)
 

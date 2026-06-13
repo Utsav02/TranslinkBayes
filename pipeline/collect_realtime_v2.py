@@ -30,6 +30,34 @@ def _to_pacific(utc_dt: datetime) -> str:
     return utc_dt.astimezone(_pacific).strftime("%Y-%m-%d %H:%M:%S")
 
 
+# Append-only snapshot log. CREATE IF NOT EXISTS here too (not only in
+# create_tables_v2.py) so deploying the new collector needs no separate
+# migration step — the first run materializes the table on an existing DB.
+_SNAPSHOT_DDL = """
+CREATE TABLE IF NOT EXISTS stop_delays_snapshots (
+    trip_id                TEXT,
+    route_id               TEXT,
+    stop_id                TEXT,
+    stop_sequence          INTEGER,
+    actual_arrival         TEXT,
+    actual_arrival_pacific TEXT,
+    delay_seconds          INTEGER,
+    bus_id                 TEXT,
+    timestamp              TEXT,
+    service_date           TEXT,
+    PRIMARY KEY (trip_id, stop_id, service_date, timestamp)
+);
+CREATE INDEX IF NOT EXISTS idx_snap_traj  ON stop_delays_snapshots (trip_id, stop_id, service_date);
+CREATE INDEX IF NOT EXISTS idx_snap_route ON stop_delays_snapshots (route_id);
+CREATE INDEX IF NOT EXISTS idx_snap_svc   ON stop_delays_snapshots (service_date);
+"""
+
+
+def _ensure_snapshot_table(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SNAPSHOT_DDL)
+    conn.commit()
+
+
 def _start_run(conn: sqlite3.Connection) -> int:
     cur = conn.execute(
         "INSERT INTO collection_runs (started, status) VALUES (?, 'running')",
@@ -119,6 +147,27 @@ def collect(conn: sqlite3.Connection) -> int:
     )
     conn.commit()
     after = conn.execute("SELECT COUNT(*) FROM stop_delays").fetchone()[0]
+
+    # Append every snapshot to the immutable log (best-effort: a failure here
+    # must NEVER break the primary upsert above, which already committed).
+    # timestamp is per-row and carries microseconds, so each fetch appends new
+    # rows rather than colliding with a prior fetch; OR IGNORE guards the rare
+    # within-fetch duplicate (branching topology, identical microsecond stamp).
+    try:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO stop_delays_snapshots (
+                trip_id, route_id, stop_id, stop_sequence,
+                actual_arrival, actual_arrival_pacific, delay_seconds, bus_id,
+                timestamp, service_date
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            rows,
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        logging.error("Snapshot log insert failed (non-fatal, upsert succeeded): %s", exc)
+
     return len(rows), after - before  # (total_processed, net_new_trips)
 
 
@@ -126,6 +175,7 @@ if __name__ == "__main__":
     logging.info("collect_realtime_v2 started")
     conn = sqlite3.connect(DB_REALTIME)
     conn.execute("PRAGMA journal_mode=WAL")
+    _ensure_snapshot_table(conn)
     run_id = _start_run(conn)
     try:
         n, net_new = collect(conn)
