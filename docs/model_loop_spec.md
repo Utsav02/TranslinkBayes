@@ -13,7 +13,7 @@ document has been fit yet; the candidate queue below is a **pre-registration**.
 | Set | Definition |
 |---|---|
 | **TRAIN** | service_date 2026-05-30 → 2026-06-07, minus anomaly days (rule in `fit_m3.R`), minus excluded routes (12940, 6700, 30055, 6702, 6718, 6619), minus held-out routes 6641 & 6705, standard row filters (`route_id != ''`, non-NULL model columns, `|delay| ≤ 3600`, `|prev| ≤ 3600`) |
-| **TEST (frozen)** | service_date **2026-06-08 → 2026-06-12**, same row filters, ALL routes except the six excluded (i.e. 6641/6705 are present in TEST but never in TRAIN) |
+| **TEST (frozen)** | service_date **2026-06-08 → 2026-06-11** (four complete dense days; 06-12 excluded — see below), same row filters, ALL routes except the six excluded (i.e. 6641/6705 are present in TEST but never in TRAIN) |
 
 **Why by date, not by route:** deployment is forecasting *future* days, and a
 date split also keeps within-trip rows (which share a trip and are serially
@@ -26,29 +26,67 @@ already exists in `fit_m3.R` and is kept as a *secondary* readout
 boundary (`static_sync_gap_check.md` §2) — train and test sit on different
 schedules, which is a *deliberately honest* (slightly hard) deployment
 scenario; the test window contains a dense Monday (Jun 8), repairing the
-biggest dow blind spot; and it contains **zero FIFA match days** (first match
-Jun 13), so the loop measures regular-service skill and match-day regime
-shifts can't masquerade as wins or losses.
+biggest dow blind spot.
 
-**Known asymmetry, accepted:** TRAIN has thin Mon/Tue coverage (Jun 1–2
-collapsed). A candidate that improves dow handling will be partly handicapped;
-that is preferable to a test set contaminated by selection.
+**Why TEST ends 2026-06-11, not 06-12 (FIFA contamination guard):** the first
+FIFA match at BC Place is **2026-06-13 21:00 PT**, and TransLink's FIFA service
+changes (route 130 detour, extra service on 14/19/23/28/222) are active from
+**2026-06-08**. So even the test window already sits inside the FIFA *service*
+regime — that is tolerable (it is a single consistent regime across all four
+test days, and the same routes' shape_dist caveats apply uniformly). What is
+**not** tolerable is letting match-eve effects or an incomplete day leak in:
+06-12 (Fri) is match-eve with BC Place setup / downtown closures beginning, and
+as of the freeze it is also a *partial* collection day (~117K rows vs 400–640K
+for complete days). Ending at 06-11 (Thu) gives four complete, pre-match,
+single-regime days and a full buffer before any match-day signal. Match-day
+regime modelling is deferred to the v2 queue with its own split (§4).
 
-### 1.2 Freezing mechanics (iteration 0, before any fit)
+**Standing caveat — thin TRAIN window (applies to every conclusion the loop
+draws):** TRAIN is only **~9 dense days** (2026-05-30 → 06-07), and Mondays are
+effectively absent (Jun 1 collapsed; the only clean dense Monday, Jun 8, is in
+TEST not TRAIN). Tuesdays are similarly thin. This is acceptable for a
+*reference baseline* and for relative ΔELPD comparisons between candidates
+(every candidate shares the same handicap), but it caps external validity:
+any accepted effect — especially day-of-week, weather, or anything seasonal —
+is established on barely over a week of data spanning one weekly cycle, and
+must be reported as provisional pending a wider window. A candidate that
+improves dow handling is also partly handicapped by the train gap; that is
+preferable to contaminating the test set by selection. **Every PASS in the
+closing summary must carry this caveat explicitly.**
 
-1. `venv/bin/python3 pipeline/process_delays.py --since 2026-06-08`
-   (incremental — see `static_sync_gap_check.md` §4; do NOT full-rebuild).
-2. Export one parquet, then materialize `exports/loop_train.parquet` and
-   `exports/loop_test.parquet` by the definitions above (deterministic
-   script, seed 42 for the per-route subsampling of TRAIN if subsampling is
-   retained).
-3. Record both files' SHA-256 + row counts in `exports/run_log.csv`'s
-   companion `exports/loop_split_manifest.txt` and commit the manifest
+### 1.2 Freezing mechanics (iteration 0)
+
+> **Steps 1–2 are run MANUALLY BY THE OWNER, not by the loop session.** They
+> are the only steps that write to a database or regenerate parquets — i.e.
+> the only destructive surface — and the incremental-vs-full-rebuild nuance
+> (`static_sync_gap_check.md` §4) is exactly the kind of thing a loop agent
+> could fat-finger into a full rebuild that silently degrades pre-Jun-8 joins.
+> The loop session begins at step 4, with the frozen parquets already on disk
+> and recorded in the manifest. See §3 "out of scope" and §5.3.
+
+**Owner-run, exact commands (do not improvise; do not substitute `--since
+2026-05-09`):**
+
+```bash
+cd /Users/utsavsingh/Desktop/Post-Uni/Projects/TranslinkBayes
+# 1. Incremental reprocess of new-schedule dates ONLY (safe; correct static join)
+venv/bin/python3 pipeline/process_delays.py --since 2026-06-08
+# 2. Export the all-routes parquet covering both train and test windows
+venv/bin/python3 pipeline/export_route.py --route all --since 2026-05-30
+```
+
+3. **(Owner or a one-shot setup script, not the loop):** from that parquet,
+   materialize `exports/loop_train.parquet` (≤ 2026-06-07, filters/exclusions
+   per §1.1, seed-42 per-route subsample) and `exports/loop_test.parquet`
+   (2026-06-08 → 2026-06-11, filters per §1.1). Record both files' SHA-256 +
+   row counts in `exports/loop_split_manifest.txt` and commit the manifest
    (parquets stay gitignored). **The TEST parquet is never regenerated**, even
-   as collection continues. New data accruing after Jun 12 is not used by
-   this loop at all — neither side of the split moves.
-4. Re-evaluate baseline m3 ONCE on the frozen TEST set (ELPD, RMSE, MAE,
-   coverage) — this row is the reference value for gate G4/G5.
+   as collection continues. New data accruing after Jun 11 (including all FIFA
+   match days, from Jun 13) is not used by this loop at all — neither side of
+   the split moves.
+4. **(Loop iteration 0):** re-evaluate baseline m3 ONCE on the frozen TEST set
+   (ELPD, RMSE, MAE, coverage) — read-only on the parquets; this row is the
+   reference value for gate G4/G5.
 
 ### 1.3 Subsampling policy
 
@@ -152,10 +190,16 @@ integrity broken).
 one iteration per **4 hours** (or one per session). This is not a tight poll
 loop; the wakeup interval exists only to resume after a fit finishes.
 
-**Out of scope for the loop (hard rules):** no collector/launchd changes, no
-database writes outside `processed_stops`-derived parquets, no new external
-data acquisition unless the candidate explicitly lists it (C7 weather), no
-prior tightening to chase convergence without logging it as a deviation.
+**Out of scope for the loop (hard rules):** no collector/launchd changes; **no
+running of `process_delays.py` or `export_route.py`, and no database writes of
+any kind** — the owner runs §1.2 steps 1–2 manually before the loop starts, and
+the loop only ever reads the already-frozen `loop_train.parquet` /
+`loop_test.parquet`. A loop that finds those parquets missing must STOP and ask
+the owner, never regenerate them (the full-vs-incremental rebuild nuance is too
+easy to get wrong — see `static_sync_gap_check.md` §4). No new external data
+acquisition unless the candidate explicitly lists it (C7 weather, and only from
+the already-materialized `exports/weather_hourly.parquet`); no prior tightening
+to chase convergence without logging it as a deviation.
 
 ## 4. Pre-registered candidate queue (v1, 2026-06-12)
 
@@ -173,7 +217,7 @@ s(hour, bs="cc", k=8) + s(dow, bs="cc", k=5) + (1|route_id) + (1|trip_id) +
 | **C4** | `s(shape_dist_traveled)` replaces linear term | delay accumulation along the route is non-linear (recovery padding at route ends) | none |
 | **C5** | + `(1 + previous_stop_delay | route_id)` random slopes | propagation strength differs by route type (express vs local) | none |
 | **C6** | + `ar(time = stop_sequence, gr = trip_serv_id, p = 1)` | residual serial correlation along the trip persists beyond the LAG term | trip×date grouping var |
-| **C7** | + `precip_mm + temp_c` (ECCC hourly, station 1108446) | rain increases delays and delay variance beyond all schedule features | **external fetch — needs owner sign-off** |
+| **C7** | + `precip_mm + temp_c` (ECCC hourly, station 1108446) | rain increases delays and delay variance beyond all schedule features | **APPROVED** — fetch via `pipeline/fetch_weather_eccc.py`; owner materializes `exports/weather_hourly.parquet` and joins it into the loop parquets on Pacific (date, hour) during §1.2 step 3 |
 | **C8** | same formula; TRAIN scaled to top-50 routes × 2,000 rows | the subsampling policy, not model structure, is the binding constraint (posterior SDs shrink, held-out ELPD improves) | none (longer fit, expect ≫ 3 h) |
 | **C9** | distributional: `bf(…, sigma ~ is_rush_hour + s(hour, bs="cc", k=8))` | residual scale is time-varying (heteroscedastic); ELPD gains come from calibration, not point accuracy | none |
 
@@ -183,12 +227,17 @@ expensive ones. **FIFA regime candidates are explicitly deferred to a v2
 queue** with a new frozen split once match days exist in both train and test
 (earliest ~mid-July).
 
-## 5. Decisions needed from the owner before iteration 0
+## 5. Owner decisions — RESOLVED 2026-06-12
 
-1. **Approve the frozen split** (train ≤ Jun 7 / test Jun 8–12, route holdout
-   kept). Alternative considered and rejected: route-only holdout (leaves
-   temporal generalization untested; date split subsumes it).
-2. **Weather acquisition (C7)** — yes/no on adding the ECCC fetch script.
-   Without it C7 is skipped and logged as "not run — data not acquired."
-3. Whether the loop may run `process_delays.py --since 2026-06-08` and the
-   export itself (iteration 0), or you run those two commands manually first.
+1. **Frozen split — APPROVED**, with the FIFA correction applied: train ≤
+   2026-06-07, **test 2026-06-08 → 06-11** (06-12 dropped as match-eve +
+   partial), route holdout 6641/6705 kept. Standing thin-train caveat (§1.1)
+   attaches to every conclusion. Alternative considered and rejected:
+   route-only holdout (leaves temporal generalization untested; date split
+   subsumes it).
+2. **Weather acquisition (C7) — APPROVED.** ECCC hourly, free/no-key, fetched
+   by `pipeline/fetch_weather_eccc.py`; joined into the loop parquets on
+   Pacific (date, hour). C7 stays in the queue.
+3. **Reprocess/export — owner runs manually** (the two commands in §1.2). The
+   loop has no DB-write or processing surface (§3 out-of-scope). Resolved: the
+   loop does NOT run these.
