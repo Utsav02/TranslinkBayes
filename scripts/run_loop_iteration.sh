@@ -95,19 +95,38 @@ if [[ ! -f "$FITR" ]]; then
   exit 3
 fi
 
-# ── 4. Real launch: Rscript must run from analysis/ (relative paths). Wrap a cd in a
-# subshell command so sleepproof_run keeps the assertion bound to the R process.
-( cd "$ROOT/analysis" && "$ROOT/scripts/sleepproof_run.sh" "$LOG" Rscript "$next_script" )
+# ── 4. Real launch: Rscript must run from analysis/ (relative paths). Capture
+# the detached PID so liveness can sample the process tree's CPU-time.
+launch_out="$("$ROOT/scripts/sleepproof_run.sh" "$LOG" \
+                bash -c "cd '$ROOT/analysis' && exec Rscript '$next_script'")"
+echo "$launch_out"
+ROOT_PID="$(echo "$launch_out" | grep -oE 'PID=[0-9]+' | head -1 | cut -d= -f2)"
 
-# ── 5. Verify liveness ───────────────────────────────────────────────────────
-echo "[verify] waiting for $next_id to pass iteration 50..."
-for i in $(seq 1 80); do
-  if grep -qE "Iteration: +(1[0-9][0-9]|[2-9][0-9][0-9]|1[0-9]{3}|2000) / 2000" "$LOG" 2>/dev/null; then
-    echo "[ok] $next_id progressing past iter 50"
-    pmset -g assertions | grep -m1 "PreventSystemSleep " || true
-    exit 0
-  fi
-  pgrep -f "$next_script" >/dev/null || { echo "FAIL: R process for $next_id exited early" >&2; tail -8 "$LOG" >&2; exit 1; }
-  sleep 30
-done
-echo "WARN: $next_id not past iter 50 after 40min — inspect $LOG" >&2; exit 2
+# ── 5. Verify liveness via CPU-TIME DELTA (robust to stdout buffering) ────────
+# Stan/brms progress logs are block-buffered even under a pty, so "iter > 50 in
+# the log" can lag a healthy fit by an hour. A *suspended* process (the way
+# earlier fits died — system sleep) freezes CPU-time; a live one accumulates it.
+# So: confirm the assertion is held AND the process tree's CPU-time climbs.
+descendants() { local p="$1" k; echo "$p"; for k in $(pgrep -P "$p" 2>/dev/null || true); do descendants "$k"; done; }
+tree_cpu_secs() {
+  local csv; csv="$(descendants "$1" | paste -sd, -)"
+  ps -o time= -p "$csv" 2>/dev/null | awk -F: '
+    {s=0; if(NF==3)s=$1*3600+$2*60+$3; else if(NF==2)s=$1*60+$2; else s=$1; tot+=s} END{printf "%.1f", tot}'
+}
+sleep 45   # let Stan compile + start sampling
+c1="$(tree_cpu_secs "$ROOT_PID")"
+sleep 30
+c2="$(tree_cpu_secs "$ROOT_PID")"
+assertions="$(pmset -g assertions)"; held=0; [[ "$assertions" == *PreventSystemSleep* ]] && held=1
+delta="$(awk -v a="$c1" -v b="$c2" 'BEGIN{printf "%.1f", b-a}')"
+iter_seen="$(grep -oE "Iteration: +[0-9]+ / 2000" "$LOG" 2>/dev/null | tail -1 || true)"
+
+echo "[verify] CPU-time ${c1}s -> ${c2}s (Δ ${delta}s over 30s)  assertion_held=$held  log:'${iter_seen}'"
+if [[ $held -eq 1 ]] && awk -v d="$delta" 'BEGIN{exit !(d>5)}'; then
+  echo "[ok] $next_id genuinely progressing (CPU-time climbing, sleep assertion held)"
+  exit 0
+fi
+if ! kill -0 "$ROOT_PID" 2>/dev/null; then
+  echo "FAIL: $next_id process exited during verification" >&2; tail -8 "$LOG" >&2; exit 1
+fi
+echo "WARN: $next_id CPU-time not climbing (Δ ${delta}s) — possible stall, inspect $LOG" >&2; exit 2

@@ -34,9 +34,15 @@ fi
 # nohup + & + disown: fully detached from this shell's job table and immune to
 # SIGHUP. caffeinate -s wraps the command, so the assertion lives exactly as
 # long as the command does (caffeinate exits when its child exits).
-nohup caffeinate -s "$@" > "$LOGFILE" 2>&1 &
+#
+# `script -q /dev/null` runs the command under a pseudo-tty so its stdout is
+# LINE-buffered, not 4KB-block-buffered. Without this, a redirected Stan/brms
+# fit only flushes its progress log every ~4KB (≈hundreds of iterations), so a
+# log-based liveness check (run_loop_iteration.sh) would falsely report a stall
+# on a perfectly healthy fit. macOS has no `stdbuf`; `script` is the portable fix.
+nohup caffeinate -s script -q /dev/null "$@" > "$LOGFILE" 2>&1 &
 PID=$!
 disown "$PID" 2>/dev/null || true
 
 echo "launched PID=$PID  log=$LOGFILE"
-echo "  command: caffeinate -s $*"
+echo "  command: caffeinate -s script -q /dev/null $*"
