@@ -42,6 +42,32 @@ unseen-route evaluation).
 | 2026-05-20 | m3 | 3,608 (50 rt) | 0.9969 [0.9944, 0.9996] | 20.18 | 2.01 | 1.0065 | 1,011 | 56 | 37.81 | 89.59 | 0.858 |
 | 2026-05-20 | m2 | 2,532 | 0.9988 [0.9955, 1.0021] | 31.64 | 2.06 | 1.0096 | 620 | 34 | 63.88 | 105.13 | 0.783 |
 | 2026-06-07 | m3 | 7,842 (25 rt) | 0.9969 | 20.18 | 2.01 | 1.0068 | 1,011 | 56 | 32.72 | 72.65 | 0.864 |
+| **2026-06-13** | **m3 (genuine refit)** | 7,842 (25 rt) | 1.0007 [0.9993, 1.002] | **9.68** | 2.00 | **1.0356** | **315** | **9** | 24.87 | 67.78 | 0.827 |
+
+### ⚠ 2026-06-13 genuine refit — FAILS the convergence gate (loop NO-GO)
+
+The 2026-06-13 row is the **first genuinely independent m3 fit** (`fit_refit="always"`
+path, cache cleared, parquet `all_routes_2026-06-07.parquet`, seed 42; ~5 h wall,
+sleep-proofed). It is the honest current baseline and it does **not** pass §4:
+
+- **R-hat max 1.0356** (> 1.01) — G1 fail.
+- **9 divergent transitions** (> 0) — G2 fail. The 56-divergence problem from
+  the stale rows reproduces in milder but still-failing form.
+- **bulk-ESS proxy 315** (< 400) — G3 fail.
+
+It also shows the stale rows were optimistic: genuine `sigma` is **9.68** (not
+20.18), `route_sd` jumped 0.74 → **3.47**, ESS fell 1,011 → 315. The likely
+cause is the near-saturated `(1 | trip_id)` term (~5,500 levels on 7,842 rows ≈
+1.4 obs/level → funnel geometry). PSIS-LOO flagged 31/7,842 obs with Pareto-k >
+0.7 (0.4%) — minor, not the blocker.
+
+**Decision: do NOT start the open C1–C9 loop.** First get a clean-converging
+reference. Run **C0** (m3 at `adapt_delta = 0.99`) on the frozen split; if
+divergences/R-hat persist, escalate to a non-centred parameterization of the
+trip-level RE or reconsider `(1 | trip_id)` itself. Only once a reference
+passes G1–G3 should the structural candidates (which all inherit this geometry)
+be fit — otherwise every candidate starts from an unconverged baseline and
+ΔELPD comparisons are unreliable.
 
 ### ⚠ Known integrity caveats on this table
 
@@ -61,9 +87,11 @@ unseen-route evaluation).
    (whatever the 25%-of-dates tail was on the day of the run). They are not
    comparable across rows. This is exactly what the frozen split in
    `model_loop_spec.md` fixes.
-4. A reproducibility re-fit of m3 via `fit_m3.R` (cache cleared, parquet
-   vintage 2026-06-07, seed 42) was launched 2026-06-12; its row is appended
-   to `run_log.csv` and this section should be updated with the result.
+4. The reproducibility re-fit (launched 2026-06-12, completed 2026-06-13) is
+   now logged as the **2026-06-13 row above** and analysed in the box above it.
+   Result: it does not reproduce the stale numbers and fails the convergence
+   gate (R-hat 1.0356, 9 divergences, ESS 315) → loop is NO-GO until C0 yields
+   a clean reference.
 
 ## 3. The metric
 
