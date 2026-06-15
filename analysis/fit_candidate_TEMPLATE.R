@@ -68,35 +68,10 @@ np       <- bayesplot::nuts_params(fit)
 n_div    <- sum(np$Value[np$Parameter == "divergent__"])
 cat(sprintf("%s rhat_max=%.4f  divergences=%d\n", CANDIDATE_ID, rhat_max, n_div))
 
-# ── Held-out evaluation on the FROZEN test set ───────────────────────────────
-# Pointwise test log-lik → ELPD (and ΔELPD±SE vs the saved baseline pointwise).
-ll <- log_lik(fit, newdata = test, allow_new_levels = TRUE, sample_new_levels = "gaussian")
-saveRDS(ll, sprintf("../exports/loglik_%s.rds", CANDIDATE_ID))
-elpd_obj <- loo::elpd(ll)
-cat(sprintf("%s held-out ELPD=%.1f (SE %.1f)\n",
-            CANDIDATE_ID, elpd_obj$estimates["elpd", "Estimate"],
-            elpd_obj$estimates["elpd", "SE"]))
-base_ll <- "../exports/loglik_C0.rds"
-if (file.exists(base_ll) && CANDIDATE_ID != "C0") {
-  cmp <- loo::loo_compare(loo::elpd(readRDS(base_ll)), elpd_obj)
-  cat("ΔELPD vs C0 (loo_compare):\n"); print(cmp)
-}
-
-pred <- posterior_predict(fit, newdata = test, allow_new_levels = TRUE,
-                          sample_new_levels = "gaussian")
-mu <- colMeans(pred)
-lo <- apply(pred, 2, quantile, 0.05); hi <- apply(pred, 2, quantile, 0.95)
-results <- test |>
-  mutate(pred = mu, residual = delay_seconds - mu,
-         covered = delay_seconds >= lo & delay_seconds <= hi)
-cat(sprintf("%s MAE=%.2f RMSE=%.2f cov90=%.4f\n", CANDIDATE_ID,
-            mean(abs(results$residual)), sqrt(mean(results$residual^2)),
-            mean(results$covered)))
-
-# ── Append a run_log row (loop memory). model_file embeds the id so
-#    run_loop_iteration.sh sees this candidate as "done". ───────────────────
-source("run_tracker.R")
-track_run(model = fit, train_df = train, test_df = test, results = results,
-          model_file = sprintf("models/brms_%s.rds (loop %s, frozen test)", CANDIDATE_ID, CANDIDATE_ID),
-          n_routes = dplyr::n_distinct(train$route_id))
+# ── Held-out eval + run_log row, MEMORY-SAFE (16 GB: full-set ELPD via log_lik,
+#    freed before a chunked posterior_predict for RMSE/coverage). See loop_eval.R.
+#    A whole-matrix eval OOMs on the 104k-row frozen test set on this machine.
+source("loop_eval.R")
+eval_and_log(fit, CANDIDATE_ID, train, test,
+             model_file = sprintf("models/brms_%s.rds (loop %s, frozen test)", CANDIDATE_ID, CANDIDATE_ID))
 cat(sprintf("%s logged to run_log.csv\n", CANDIDATE_ID))
