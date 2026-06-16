@@ -6,6 +6,8 @@
 # or after 3 consecutive G4 non-passes (model_loop_spec.md §3).
 #
 # id	fit_script (analysis/)	one_line_hypothesis
+C0_notrip	fit_candidate_C0_notrip.R	STRUCTURAL DIAGNOSTIC (2026-06-14): m3 minus (1|trip_id), default adapt_delta — is the ~5,500-level trip RE (funnel) what breaks m3 convergence + a clean C0 reference
+C0_nu4	fit_candidate_C0_nu4.R	CONVERGENCE EXPERIMENT (2026-06-15): m3 with nu FIXED at 4 (constant prior). Localization showed nu railed at the lb=2 floor in 100% of draws of both m3 and C0_notrip — near-Cauchy likelihood is the suspected cause. HARD STOP if not clean.
 C0	fit_candidate_C0.R	baseline m3 at adapt_delta=0.99 — clean-converging reference (G2: zero divergences)
 C1	fit_candidate_C1.R	settled-rows-only TRAIN — does b_prev fall well below 1 (feed carry-forward validity probe)
 C2	fit_candidate_C2.R	+ log(headway_obs/headway_sched) — bunching amplifies delay beyond carry-forward
