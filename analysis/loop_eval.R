@@ -1,25 +1,54 @@
 # Memory-safe held-out evaluation for the model-search loop (16 GB-friendly).
 #
-# The naive eval held a 4000-draw × 104k-test-row log_lik matrix AND a same-size
-# posterior_predict matrix simultaneously (~3.3 GB each) → OOM on a 16 GB Mac.
-# Fix: compute full-set ELPD via log_lik first, save only the small POINTWISE
-# vector (for ΔELPD±SE), FREE the matrix, then get RMSE/coverage from a CHUNKED
-# posterior_predict (one row-block in memory at a time).
-suppressMessages({ library(brms); library(loo); library(dplyr) })
+# Two OOM mechanisms hit this on a 16 GB Mac with the 104k-row frozen test set:
+#   (1) log_lik(fit, newdata=test) materializes the 4000-draw x 104k-row matrix
+#       in one shot (~3.3 GB just for the result, plus brms' internal predictor
+#       matrices for splines + 3 REs — easily 8+ GB on top of a ~600 MB fit).
+#       This is what killed the C0_nu4 eval AFTER convergence diagnostics
+#       printed but BEFORE log_lik returned.
+#   (2) posterior_predict on the full test set has the same shape.
+# Fix: CHUNK BOTH steps. For each row-block, compute log_lik and accumulate the
+# pointwise ELPD; then posterior_predict for mu / coverage. One block in memory
+# at a time, never the full matrix.
+suppressMessages({ library(brms); library(loo); library(dplyr); library(matrixStats) })
 
 eval_and_log <- function(fit, candidate_id, train, test,
-                         model_file = NULL, chunk = 8000) {
+                         model_file = NULL, chunk = 4000) {
   if (!"date" %in% names(train)) train$date <- as.Date(train$service_date)
 
-  # ── ELPD on the FULL test set (log_lik works at full size; free it after) ──
-  ll <- log_lik(fit, newdata = test, allow_new_levels = TRUE,
-                sample_new_levels = "gaussian")
-  e       <- loo::elpd(ll)
-  elpd_pw <- e$pointwise[, "elpd"]                       # length = nrow(test), tiny
+  n  <- nrow(test)
+  blocks <- split(seq_len(n), ceiling(seq_len(n) / chunk))
+  elpd_pw <- numeric(n)
+  mu  <- numeric(n); cov <- logical(n)
+
+  for (k in seq_along(blocks)) {
+    ix <- blocks[[k]]
+    nd <- test[ix, , drop = FALSE]
+
+    # ── pointwise log_lik on this block only ──
+    ll <- log_lik(fit, newdata = nd, allow_new_levels = TRUE,
+                  sample_new_levels = "gaussian")
+    # ELPD_i = log mean exp(log_lik[, i]) — done column-wise without forming new big mats
+    elpd_pw[ix] <- matrixStats::colLogSumExps(ll) - log(nrow(ll))
+    rm(ll); gc(verbose = FALSE)
+
+    # ── posterior_predict on the same block for RMSE / 90% coverage ──
+    pp <- posterior_predict(fit, newdata = nd, allow_new_levels = TRUE,
+                            sample_new_levels = "gaussian")
+    mu[ix] <- colMeans(pp)
+    qs     <- matrixStats::colQuantiles(pp, probs = c(0.05, 0.95))
+    cov[ix] <- test$delay_seconds[ix] >= qs[, 1] & test$delay_seconds[ix] <= qs[, 2]
+    rm(pp, qs); gc(verbose = FALSE)
+
+    if (k == 1 || k == length(blocks) || k %% 5 == 0)
+      cat(sprintf("  [%s] eval block %d/%d (%d rows)\n", candidate_id, k, length(blocks), length(ix)))
+  }
+
   saveRDS(elpd_pw, sprintf("../exports/elpd_pointwise_%s.rds", candidate_id))
-  cat(sprintf("%s held-out ELPD=%.1f (SE %.1f) over %d rows\n", candidate_id,
-              e$estimates["elpd", "Estimate"], e$estimates["elpd", "SE"], length(elpd_pw)))
-  base <- "../exports/elpd_pointwise_C0.rds"             # reference once C0 exists
+  elpd_tot <- sum(elpd_pw); elpd_se <- sd(elpd_pw) * sqrt(length(elpd_pw))
+  cat(sprintf("%s held-out ELPD=%.1f (SE %.1f) over %d rows\n",
+              candidate_id, elpd_tot, elpd_se, length(elpd_pw)))
+  base <- "../exports/elpd_pointwise_C0.rds"
   if (file.exists(base) && candidate_id != "C0") {
     pb <- readRDS(base)
     if (length(pb) == length(elpd_pw)) {
@@ -28,19 +57,7 @@ eval_and_log <- function(fit, candidate_id, train, test,
                   sum(d), sd(d) * sqrt(length(d))))
     }
   }
-  rm(ll); gc(verbose = FALSE)
 
-  # ── RMSE / coverage from a CHUNKED posterior_predict ──────────────────────
-  n <- nrow(test); mu <- numeric(n); cov <- logical(n)
-  blocks <- split(seq_len(n), ceiling(seq_len(n) / chunk))
-  for (ix in blocks) {
-    pp <- posterior_predict(fit, newdata = test[ix, , drop = FALSE],
-                            allow_new_levels = TRUE, sample_new_levels = "gaussian")
-    mu[ix]  <- colMeans(pp)
-    qs      <- apply(pp, 2, quantile, probs = c(0.05, 0.95))
-    cov[ix] <- test$delay_seconds[ix] >= qs[1, ] & test$delay_seconds[ix] <= qs[2, ]
-    rm(pp); gc(verbose = FALSE)
-  }
   results <- test |> mutate(pred = mu, residual = delay_seconds - mu, covered = cov)
   cat(sprintf("%s MAE=%.2f RMSE=%.2f cov90=%.4f\n", candidate_id,
               mean(abs(results$residual)), sqrt(mean(results$residual^2)),
