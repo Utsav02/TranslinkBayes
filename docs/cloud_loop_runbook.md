@@ -92,7 +92,7 @@ Concretely, from the laptop:
 
 ```bash
 ssh user@cloudbox 'mkdir -p TranslinkBayes/exports TranslinkBayes/analysis/models'
-REF=C_m2nu4   # whichever reference baseline_registry.md names
+REF=C_m2nu4   # the reference selected 2026-06-16; see baseline_registry.md §2.1
 scp exports/loop_train.parquet exports/loop_test.parquet \
     exports/elpd_pointwise_${REF}.rds \
     user@cloudbox:TranslinkBayes/exports/
