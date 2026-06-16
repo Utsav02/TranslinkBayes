@@ -28,7 +28,46 @@ set.
 
 Cost reference points (no endorsement, just so the order of magnitude is real):
 AWS `m6i.2xlarge` (8 vCPU / 32 GB), GCP `n2-standard-8`, Hetzner CX52 — all
-under $0.40/h on demand. Total loop spend ≈ $20–40 even at unhurried pace.
+under $0.40/h on demand, ~$0.08/h preemptible/spot.
+
+### Use a preemptible / SPOT instance
+
+The loop is **preemption-safe by construction**: every iteration ends with a
+`git push` of the new `run_log.csv` row, and the next iteration reads
+`run_log.csv` as memory to decide what to fit next. If the box is reclaimed
+mid-fit, no completed work is lost; just relaunch the instance, `git pull`,
+`renv::restore`, and the loop resumes from the next un-run candidate. The
+worst case is losing the *in-progress* fit (a few hours of CPU), which is
+exactly the trade preemptibles are designed for. Use:
+
+- AWS EC2 Spot `m6i.2xlarge` (~$0.05–0.08/h)
+- GCP Spot `n2-standard-8` (~$0.07/h)
+- Hetzner CX52 (not preemptible, but $0.04/h on demand — even cheaper).
+
+### Queue size and compute estimate (v2 queue, 2026-06-16)
+
+`analysis/loop_candidates.tsv` (reconciled) has **8 active candidates** to fit
+on cloud (C7, C2, C5, C3, C4, C1, C9, C8). The three completed laptop fits
+(C0_notrip, C0_nu4, C_m2nu4) are already in `run_log.csv` and skipped. Two
+v1 candidates were dropped with documented evidence (C0, C6).
+
+Per-candidate cloud wall-time, calibrated against C_m2nu4 (laptop, 4-core,
+~2h) scaled to 8-vCPU / 32 GB cloud:
+
+| Candidates | Per-fit wall (cloud) | Per-fit cost (spot) |
+|---|---|---|
+| C7, C2, C5, C3, C4, C1, C9 (7 standard fits) | ~1.5–2.5 h each | ~$0.10–$0.20 each |
+| C8 (75k-row scale-up) | ~6–8 h | ~$0.50–$0.65 |
+| **Total compute** | **~16–25 h** | **~$2–$4 raw fit cost** |
+
+Add ~2 h for first-time Stan compilations (cached after) + per-iteration eval
+(~30 min on the chunked path) + audit time. Practical end-to-end budget on
+spot: **~$10–20**, **~2–3 calendar days** at one iteration per session.
+
+If a candidate fails the strict gate (R-hat<1.01, 0 div, ESS≥400) or the G4
+ΔELPD bar, log the row and move on; do **not** retry on the cloud. The
+stop-after-3-non-improvements rule (`model_loop_spec.md §3`) ends the loop
+early if the data isn't carrying the candidates.
 
 A non-sleeping server **eliminates the entire sleep-proofing layer**:
 `caffeinate`, the `script -q /dev/null` pty wrapper, and the CPU-time-delta

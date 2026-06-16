@@ -1,21 +1,43 @@
-# Pre-registered model-search candidate queue (v1, 2026-06-12).
-# Authoritative prose + formulas: docs/model_loop_spec.md §4. This file is the
-# MACHINE-READABLE order the loop walks. A candidate is "done" iff run_log.csv
-# has a row whose model_file column contains its id (e.g. "...fit_candidate_C2...").
-# The loop fits the LOWEST-numbered id with no run_log row. STOP when none remain
-# or after 3 consecutive G4 non-passes (model_loop_spec.md §3).
+# Pre-registered model-search candidate queue (v2, reconciled 2026-06-16).
+# Authoritative prose + formulas: docs/model_loop_spec.md §4.
+#
+# CHANGES vs v1 (2026-06-12) — triage against the four laptop fits' evidence:
+#   - REFERENCE is now C_m2nu4 (baseline_registry.md §2.1), accepted under the
+#     RELAXED reference gate. CANDIDATES still face the STRICT §4 gate
+#     (R-hat<1.01, 0 divergences, ESS>=400).
+#   - All formulas now modify the C_m2nu4 BASE (not m3): delay_seconds ~
+#     previous_stop_delay + shape_dist_traveled + s(hour,cc,8) + s(dow,cc,5)
+#     + (1|route_id); student() with nu=constant(4); exp(0.5) on class=sd.
+#   - High-cardinality main random INTERCEPTS on trip_id or stop_id are off the
+#     table on the current 9-dense-day split (m3, C0_notrip, C0_nu4 all dirty;
+#     C_m2nu4 only became near-clean once both were dropped). Candidates that
+#     wanted "stop or trip structure" are reshaped to NON-funneling forms
+#     (route-level random slopes, etc.) or dropped with the reason recorded.
+#   - Queue order reflects cost vs hypothesis value: weather and bunching first
+#     (cheap, high-signal, real hypotheses); structure climbs (C5) next;
+#     interactions/non-linearities; validity probe; distributional; scale-up
+#     last (expensive). Loop is preemption-safe — run_log.csv is the memory.
+#
+# The loop fits the LOWEST-numbered id with no run_log row. STOP when none
+# remain or after 3 consecutive G4 non-passes (model_loop_spec.md §3).
 #
 # id	fit_script (analysis/)	one_line_hypothesis
-C0_notrip	fit_candidate_C0_notrip.R	STRUCTURAL DIAGNOSTIC (2026-06-14): m3 minus (1|trip_id), default adapt_delta — is the ~5,500-level trip RE (funnel) what breaks m3 convergence + a clean C0 reference
-C0_nu4	fit_candidate_C0_nu4.R	CONVERGENCE EXPERIMENT (2026-06-15): m3 with nu FIXED at 4 (constant prior). Localization showed nu railed at the lb=2 floor in 100% of draws of both m3 and C0_notrip — near-Cauchy likelihood is the suspected cause. HARD STOP if not clean.
-C_m2nu4	fit_candidate_C_m2nu4.R	DECISIVELY-SIMPLER REFERENCE (2026-06-16): m3 minus (1|trip_id) and (1|stop_id), keeping only (1|route_id); nu fixed at 4; tighter sd prior exponential(0.5). Diffuse divergence diagnosis on C0_nu4 -> stop shaving RE-by-RE; this is the last brms fit on the laptop.
-C0	fit_candidate_C0.R	baseline m3 at adapt_delta=0.99 — clean-converging reference (G2: zero divergences)
-C1	fit_candidate_C1.R	settled-rows-only TRAIN — does b_prev fall well below 1 (feed carry-forward validity probe)
-C2	fit_candidate_C2.R	+ log(headway_obs/headway_sched) — bunching amplifies delay beyond carry-forward
-C3	fit_candidate_C3.R	+ timepoint*previous_stop_delay — propagation resets at scheduled timepoints
-C4	fit_candidate_C4.R	s(shape_dist_traveled) replaces linear — non-linear delay accumulation along route
-C5	fit_candidate_C5.R	+ (1+previous_stop_delay|route_id) random slopes — propagation strength varies by route
-C6	fit_candidate_C6.R	+ ar(stop_sequence, gr=trip_serv_id, p=1) — residual serial correlation along trip
-C7	fit_candidate_C7.R	+ precip_mm + temp_c (ECCC) — weather adds signal beyond schedule features
-C8	fit_candidate_C8.R	top-50 routes x 2000 rows — subsampling, not structure, is the binding constraint
-C9	fit_candidate_C9.R	sigma ~ is_rush_hour + s(hour) — time-varying residual scale (calibration gains)
+#
+# ── COMPLETED rows in exports/run_log.csv (kept here as audit trail) ──
+C0_notrip	fit_candidate_C0_notrip.R	[2026-06-14, structural diagnostic] m3 minus (1|trip_id). R-hat 1.028, 42 div, ESS 147 → FAIL strict; dropping trip RE alone made things WORSE, ruling out single-RE-funnel as the m3 culprit.
+C0_nu4	fit_candidate_C0_nu4.R	[2026-06-15, likelihood experiment] m3 with nu fixed=4. R-hat 1.0114, 25 div, ESS 418 → FAIL strict (barely); nu-fix is necessary but not sufficient, and Step 1 localization showed remaining divergences are diffuse.
+C_m2nu4	fit_candidate_C_m2nu4.R	[2026-06-16, REFERENCE] m3 minus trip+stop REs, nu=4, exp(0.5) sd prior. R-hat 1.0043, 0.73% div, ESS 703 → near-clean. Accepted as REFERENCE under the relaxed gate (registry §2.1). All candidates below modify THIS base.
+#
+# ── ACTIVE QUEUE — runs in this order on the cloud loop ──
+C7	fit_candidate_C7.R	+ precip_mm + temp_c (ECCC, joined from exports/weather_hourly.parquet) — rain raises delays beyond schedule features. Two continuous fixed effects, no new REs. HIGHEST hypothesis value (only tier-c covariate, fetcher already built).
+C2	fit_candidate_C2.R	+ log(headway_obs / headway_sched) — bunching amplifies delay beyond per-trip carry-forward. One continuous covariate (derived from stop_delays via SQL window); no new REs.
+C5	fit_candidate_C5.R	(1|route_id) → (1 + previous_stop_delay | route_id) — propagation strength varies by route (express vs local). 25-route grouping, NOT high-cardinality; this is the "structure without funneling" template, replaces the dropped-trip/stop REs.
+C3	fit_candidate_C3.R	+ timepoint * previous_stop_delay — drivers hold at timepoints; delay propagation should reset there (slope < off-timepoint slope). Single interaction, no new REs; timepoint joined from static stop_times.
+C4	fit_candidate_C4.R	shape_dist_traveled → s(shape_dist_traveled, bs="tp", k=8) — delay accumulation along the route is non-linear (recovery padding at termini). Smooth replaces linear term, no new REs.
+C1	fit_candidate_C1.R	TRAIN filtered to "settled" rows (actual_arrival ≤ timestamp) — VALIDITY PROBE: does b_prev fall meaningfully below 1 when the response is observation-grade rather than feed prediction? G4 not expected to pass; the finding IS the answer (reported regardless).
+C9	fit_candidate_C9.R	sigma ~ is_rush_hour + s(hour, bs="cc", k=8) — residual scale is time-varying (heteroscedastic). Distributional regression on σ only; nu stays fixed=4. ELPD/coverage-oriented, not RMSE.
+C8	fit_candidate_C8.R	[reshape, scale-up] same C_m2nu4 base, training scaled to top-50 routes × 1,500 rows (~75k) — does more data identify what 25×500 cannot (tighter posteriors, better held-out ELPD)? EXPENSIVE (~6-8h cloud); run LAST.
+#
+# ── DROPPED (recorded for audit; lines commented out so the launcher skips) ──
+# C0	fit_candidate_C0.R	DROPPED 2026-06-16: m3 at adapt_delta=0.99. C0_nu4 at adapt_delta=0.95 with nu off the lb=2 floor (already better geometry than C0's plan) still produced 25 div / R-hat 1.0114. Sampler-tuning alone is insufficient against the m3 RE stack on 9 dense days. Superseded by the C_m2nu4 reference.
+# C6	fit_candidate_C6.R	DROPPED 2026-06-16: ar(stop_sequence, gr=trip_serv_id, p=1). Within-trip AR(1) requires sequential observations inside each ~5,500 trip-day group; the frozen TRAIN is a random 500-rows-per-route subsample (~2 obs/trip-day on average) — the AR coefficient is not identifiable on this split. Not a funneling problem; a sampling-policy problem. Defer to a v2 split with by-trip stratification once the dataset fattens.

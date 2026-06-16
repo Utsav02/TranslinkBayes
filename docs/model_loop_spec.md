@@ -234,31 +234,59 @@ template, then (b) runs `scripts/run_loop_iteration.sh`. Cadence generous
 (one fit per session / ~hours). The launcher's hash check + the
 "never regenerate parquets" rule (§3) are the guardrails.
 
-## 4. Pre-registered candidate queue (v1, 2026-06-12)
+## 4. Pre-registered candidate queue (v2, reconciled 2026-06-16)
 
-Each entry is a **hypothesis, not a foregone conclusion**. Formulas modify the
-m3 base: `delay_seconds ~ previous_stop_delay + shape_dist_traveled +
-s(hour, bs="cc", k=8) + s(dow, bs="cc", k=5) + (1|route_id) + (1|trip_id) +
-(1|stop_id)`, student(), shared priors, knots as in `fit_m3.R`.
+v1 (2026-06-12) presumed an m3 base. After four laptop fits, m3 cannot
+converge on this 9-dense-day split (registry §2.1). The reconciled queue
+modifies the **C_m2nu4 base** instead:
 
-| ID | Change vs m3 | Hypothesis being tested | New data prep |
-|---|---|---|---|
-| **C0** | none; `adapt_delta = 0.99` | the baseline's 56 divergences are a sampler artifact; a clean-converging m3 is the true reference | none |
-| **C1** | same formula; TRAIN restricted to settled rows (final fetch ≥ predicted arrival) | b_prev ≪ 1 on observation-grade responses ⇒ the near-unit slope is feed carry-forward (validity probe; G4 not expected to pass — judged on what it reveals, reported regardless) | settled flag (tier-b) |
-| **C2** | + `bunching` term: `+ log(headway_obs / headway_sched)` | short headways (bunching) amplify delay beyond per-trip carry-forward | headway derivation (tier-b, SQL window) |
-| **C3** | + `timepoint * previous_stop_delay` interaction | drivers hold at timepoints ⇒ delay propagation resets there (slope < off-timepoint slope) | timepoint join (tier-b) |
-| **C4** | `s(shape_dist_traveled)` replaces linear term | delay accumulation along the route is non-linear (recovery padding at route ends) | none |
-| **C5** | + `(1 + previous_stop_delay | route_id)` random slopes | propagation strength differs by route type (express vs local) | none |
-| **C6** | + `ar(time = stop_sequence, gr = trip_serv_id, p = 1)` | residual serial correlation along the trip persists beyond the LAG term | trip×date grouping var |
-| **C7** | + `precip_mm + temp_c` (ECCC hourly, station 1108446) | rain increases delays and delay variance beyond all schedule features | **APPROVED** — fetch via `pipeline/fetch_weather_eccc.py`; owner materializes `exports/weather_hourly.parquet` and joins it into the loop parquets on Pacific (date, hour) during §1.2 step 3 |
-| **C8** | same formula; TRAIN scaled to top-50 routes × 2,000 rows | the subsampling policy, not model structure, is the binding constraint (posterior SDs shrink, held-out ELPD improves) | none (longer fit, expect ≫ 3 h) |
-| **C9** | distributional: `bf(…, sigma ~ is_rush_hour + s(hour, bs="cc", k=8))` | residual scale is time-varying (heteroscedastic); ELPD gains come from calibration, not point accuracy | none |
+```r
+delay_seconds ~ previous_stop_delay + shape_dist_traveled +
+                s(hour, bs="cc", k=8) + s(dow, bs="cc", k=5) +
+                (1 | route_id)
+family   = student()                         # nu = constant(4)
+priors   = base_priors with prior(exponential(0.5), class = sd)
+knots    = list(hour = c(0, 24), dow = c(0.5, 7.5))
+iter=2000, warmup=1000, chains=4, seed=42, adapt_delta=0.95
+```
 
-Queue order is deliberate: C0 first (clean reference), validity probe second,
-then tier-b covariates (cheap, high-prior), then structure, then the two
-expensive ones. **FIFA regime candidates are explicitly deferred to a v2
-queue** with a new frozen split once match days exist in both train and test
-(earliest ~mid-July).
+Each candidate is a **hypothesis, not a foregone conclusion**. Candidates face
+the STRICT gate (R-hat<1.01, 0 div, ESS≥400, ΔELPD>2×SE on the frozen test
+set). Only the REFERENCE gets the relaxed gate (registry §2.1).
+
+| Order | ID | Change vs C_m2nu4 base | Hypothesis | Convergence risk | Data prep |
+|---|---|---|---|---|---|
+| 1 | **C7** | + `precip_mm + temp_c` | weather adds signal beyond schedule features | low (2 continuous FE) | join `weather_hourly.parquet` on Pacific (date, hour) — fetcher in `pipeline/fetch_weather_eccc.py` |
+| 2 | **C2** | + `log(headway_obs / headway_sched)` | bunching amplifies delay beyond carry-forward | low (1 continuous FE) | derive headway via SQL window over `stop_delays`, persist in TRAIN/TEST |
+| 3 | **C5** | `(1|route_id)` → `(1 + previous_stop_delay | route_id)` | propagation strength varies by route (express vs local) | **acceptable** — 25 route groups, NOT high-cardinality; this is the "structure without funneling" template that replaces the dropped trip/stop REs | none |
+| 4 | **C3** | + `timepoint * previous_stop_delay` | propagation resets at scheduled timepoints (slope < off-timepoint) | low (1 interaction) | join `timepoint` from static `stop_times` |
+| 5 | **C4** | `shape_dist_traveled` → `s(shape_dist_traveled, bs="tp", k=8)` | non-linear delay accumulation along route (recovery padding) | low (smooth, no RE) | none |
+| 6 | **C1** | TRAIN filtered to settled rows (`actual_arrival ≤ timestamp`) | **VALIDITY PROBE** — does b_prev fall well below 1 once the response is observation-grade not predicted? | low (no formula change) | settled flag (tier-b); subset shrinks TRAIN to ~5.9% — note in run_log |
+| 7 | **C9** | `bf(..., sigma ~ is_rush_hour + s(hour, bs="cc", k=8))` | residual scale is time-varying — gains in cov90/ELPD, not RMSE | medium (smooth on σ scale) | none |
+| 8 | **C8** | scale-up: top-50 routes × 1,500 rows (~75k TRAIN) | does more data identify what 25×500 cannot (tighter posteriors)? | structure unchanged; **expensive** (~6–8 h cloud) | none |
+
+The machine-readable order is `analysis/loop_candidates.tsv`. Order is
+deliberate: **front-load** the cheapest and highest-hypothesis-value
+candidates (weather, bunching, route slopes) so a preemptible cloud instance
+that doesn't finish all eight still answers the headline questions.
+
+**Dropped from v1** (the queue records the reason inline; the launcher skips
+commented rows):
+
+- **C0** (m3 at `adapt_delta=0.99`) — C0_nu4 at `adapt_delta=0.95` with nu
+  off the lb=2 floor (already better geometry than C0's plan) still produced
+  25 divergences and R-hat 1.0114. Sampler-tuning alone is insufficient
+  against the full m3 RE stack on 9 dense days. Superseded by C_m2nu4.
+- **C6** (`ar(stop_sequence, gr=trip_serv_id, p=1)`) — within-trip AR(1)
+  requires sequential observations inside each ~5,500 trip-day group, but the
+  frozen TRAIN is a random 500-rows-per-route subsample (~2 obs/trip-day on
+  average); the AR coefficient is not identifiable on this split. Not a
+  funneling problem; a sampling-policy problem. Defer to a v2 split with
+  by-trip stratification once the dataset fattens.
+
+**FIFA regime candidates remain explicitly deferred to a v2 queue** with a
+new frozen split once match days exist in both train and test (earliest
+~mid-July).
 
 **Note on C1 and the snapshot log:** an append-only `stop_delays_snapshots`
 table now captures the full prediction trajectory, but only **from 2026-06-12**
