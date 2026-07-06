@@ -3,12 +3,16 @@ Post-processing layer: joins raw stop_delays with static GTFS, computes
 previous_stop_delay via SQL window function, adds temporal features,
 and writes to processed_stops.
 
-Safe to re-run — fully overwrites processed_stops from raw data.
+Incremental re-runs (--since/--until) are safe: only that date window is
+cleared and rebuilt. A FULL rebuild (no window) requires the explicit
+--full flag: the static GTFS DB has rolled since early data was processed,
+so rebuilding everything from the *current* static tables silently degrades
+joins for old service dates (see CLAUDE.md, repo-specific overrides).
 
 Usage:
-    python process_delays.py
     python process_delays.py --since 2025-03-01
     python process_delays.py --since 2025-03-01 --until 2025-04-01
+    python process_delays.py --full          # deliberate full rebuild only
 """
 import argparse
 import logging
@@ -77,20 +81,51 @@ def _normalize_dist(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def process(since: str | None = None, until: str | None = None) -> int:
-    clauses = []
+def _validate_iso_date(value: str, name: str) -> None:
+    """Fail loudly on a malformed date: service_date comparisons are lexicographic
+    strings, so e.g. '2025-3-1' would silently select (and DELETE) the wrong window.
+    strptime alone is too lenient (it accepts non-zero-padded months/days), so the
+    value must also round-trip to itself in canonical form."""
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise SystemExit(f"--{name} must be an ISO date (YYYY-MM-DD), got: {value!r}")
+    if parsed.strftime("%Y-%m-%d") != value:
+        raise SystemExit(
+            f"--{name} must be zero-padded ISO (YYYY-MM-DD), got: {value!r} "
+            f"(did you mean {parsed.strftime('%Y-%m-%d')!r}?)"
+        )
+
+
+def process(since: str | None = None, until: str | None = None, full: bool = False) -> int:
+    if not since and not until and not full:
+        raise SystemExit(
+            "Refusing to run without a date window: this would DELETE and rebuild ALL of "
+            "processed_stops from the current static GTFS DB, silently degrading joins for "
+            "service dates whose static data has rolled (see CLAUDE.md). "
+            "Pass --since (incremental, the default workflow) or --full to do it anyway."
+        )
     if since:
-        clauses.append(f"sd.service_date >= '{since}'")
+        _validate_iso_date(since, "since")
     if until:
-        clauses.append(f"sd.service_date < '{until}'")
+        _validate_iso_date(until, "until")
+
+    clauses = []
+    params: list[str] = []
+    if since:
+        clauses.append("sd.service_date >= ?")
+        params.append(since)
+    if until:
+        clauses.append("sd.service_date < ?")
+        params.append(until)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
     conn = sqlite3.connect(DB_REALTIME)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(f"ATTACH DATABASE '{DB_STATIC}' AS static_db")
+    conn.execute("ATTACH DATABASE ? AS static_db", (str(DB_STATIC),))
 
     logging.info("Running extraction query (since=%s, until=%s)", since, until)
-    df = pd.read_sql_query(_QUERY.format(where=where), conn)
+    df = pd.read_sql_query(_QUERY.format(where=where), conn, params=params or None)
     logging.info("Extracted %d raw rows", len(df))
 
     df = _add_temporal(df)
@@ -114,14 +149,17 @@ def process(since: str | None = None, until: str | None = None) -> int:
         logging.info("Deduped %d → %d rows", before_dedup, len(out))
 
     # Clear the date window being (re)processed, then insert fresh.
-    # Always-clear is safe: processed_stops is rebuilt from stop_delays.
+    # Full clear only happens behind the explicit --full gate above.
     clauses_del = []
+    params_del: list[str] = []
     if since:
-        clauses_del.append(f"service_date >= '{since}'")
+        clauses_del.append("service_date >= ?")
+        params_del.append(since)
     if until:
-        clauses_del.append(f"service_date < '{until}'")
+        clauses_del.append("service_date < ?")
+        params_del.append(until)
     if clauses_del:
-        conn.execute("DELETE FROM processed_stops WHERE " + " AND ".join(clauses_del))
+        conn.execute("DELETE FROM processed_stops WHERE " + " AND ".join(clauses_del), params_del)
     else:
         conn.execute("DELETE FROM processed_stops")
     conn.commit()
@@ -142,9 +180,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process raw delays into analysis-ready table")
     parser.add_argument("--since", help="ISO date lower bound, e.g. 2025-03-01")
     parser.add_argument("--until", help="ISO date upper bound (exclusive)")
+    parser.add_argument(
+        "--full", action="store_true",
+        help="Deliberately clear and rebuild ALL of processed_stops from the current "
+             "static GTFS DB. Unsafe for service dates whose static data has rolled — "
+             "see CLAUDE.md before using.",
+    )
     args = parser.parse_args()
 
     started = datetime.now(timezone.utc)
-    n = process(since=args.since, until=args.until)
+    n = process(since=args.since, until=args.until, full=args.full)
     elapsed = (datetime.now(timezone.utc) - started).seconds
     print(f"Processed {n:,} rows in {elapsed}s → processed_stops")
