@@ -11,7 +11,7 @@ import pytz
 import requests
 from google.transit import gtfs_realtime_pb2
 
-from config import API_KEY, DB_REALTIME, LOG_DIR, PACIFIC_TZ, TRIP_UPDATES_URL
+from config import API_KEY, DB_REALTIME, LOG_DIR, PACIFIC_TZ, TRIP_UPDATES_URL, VEHICLE_URL
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -100,9 +100,16 @@ def collect(conn: sqlite3.Connection) -> int:
         tu       = entity.trip_update
         trip_id  = tu.trip.trip_id
         route_id = tu.trip.route_id
-        # bus_id: populated only if vehicle-position collection is added later.
-        # realtime_vehicle_positions is currently unpopulated — skip the query.
-        bus_id   = None
+        # bus_id: TransLink's trip-updates feed carries a VehicleDescriptor for
+        # ~84% of trip-updates entities (verified 2026-07-09). Extract it here;
+        # 100%-NULL bus_id was blocking per-vehicle random effects, bunching,
+        # block-continuity features, etc. Empty-string → None so the SQLite
+        # column reads as NULL for the ~16% of trips without vehicle info.
+        # (The separate gtfsposition endpoint is currently returning an empty
+        # feed — TransLink hasn't been publishing GPS positions during the
+        # setup of this project; if/when they do, `collect_vehicle_positions`
+        # picks that up independently.)
+        bus_id = tu.vehicle.id if tu.HasField("vehicle") and tu.vehicle.id else None
 
         for stu in tu.stop_time_update:
             arr_utc = (
@@ -171,6 +178,99 @@ def collect(conn: sqlite3.Connection) -> int:
     return len(rows), after - before  # (total_processed, net_new_trips)
 
 
+# ── VehiclePositions collection ──────────────────────────────────────────────
+# Added 2026-07-09. TransLink's gtfsposition feed publishes bus GPS positions
+# every ~5 min, keyed by bus_id + timestamp. Populates realtime_vehicle_positions
+# (schema in create_tables_v2.py) so downstream analysis can (a) recover TRUE
+# arrival times by spatial-joining bus positions to stop coordinates, breaking
+# the "prediction = observation" tautology, and (b) get bus_id (currently 100%
+# NULL in stop_delays), unlocking per-vehicle random effects and bunching /
+# headway derivations. Kept in a SEPARATE function so its failure NEVER kills
+# the trip-updates collection above — the two feeds are independent and the
+# trip-updates path is the more critical of the two.
+
+def parse_vehicle_positions(pb_bytes: bytes, now_utc: datetime | None = None) -> list[tuple]:
+    """Parse a GTFS-RT VehiclePositions payload into a list of rows for
+    realtime_vehicle_positions. Pure function — no I/O — for testability.
+
+    now_utc: injected so tests can fix the fallback timestamp deterministically.
+
+    Row shape: (timestamp, route_id, trip_id, stop_id, latitude, longitude,
+                bus_id, vehicle_label). Rows missing bus_id are DROPPED because
+    the table's primary key is (bus_id, timestamp) and there is no meaningful
+    identifier to fall back on.
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(pb_bytes)
+
+    rows: list[tuple] = []
+    for entity in feed.entity:
+        if not entity.HasField("vehicle"):
+            continue
+        v = entity.vehicle
+        bus_id = v.vehicle.id if v.HasField("vehicle") else ""
+        if not bus_id:
+            # No PK → cannot store. Skip.
+            continue
+
+        # Prefer the feed's own timestamp (bus reported time); fall back to
+        # collector time so the row always has SOMETHING to key on.
+        if v.timestamp:
+            ts = datetime.fromtimestamp(v.timestamp, timezone.utc).isoformat()
+        else:
+            ts = now_utc.isoformat()
+
+        rows.append((
+            ts,
+            v.trip.route_id if v.HasField("trip") else None,
+            v.trip.trip_id  if v.HasField("trip") else None,
+            v.stop_id       if v.stop_id         else None,
+            v.position.latitude  if v.HasField("position") else None,
+            v.position.longitude if v.HasField("position") else None,
+            bus_id,
+            v.vehicle.label if v.vehicle.label else None,
+        ))
+    return rows
+
+
+def collect_vehicle_positions(conn: sqlite3.Connection) -> int:
+    """Fetch the vehicle-positions feed and INSERT OR IGNORE into
+    realtime_vehicle_positions. Returns rows inserted (best-effort — a fetch
+    failure returns 0 rather than raising, so the trip-updates run still
+    reports 'ok' in collection_runs).
+    """
+    data = _fetch(VEHICLE_URL)
+    if not data:
+        logging.warning("Vehicle-positions fetch returned no data; skipping insert")
+        return 0
+    try:
+        rows = parse_vehicle_positions(data)
+    except Exception as exc:
+        logging.exception("Vehicle-positions parse failed: %s", exc)
+        return 0
+    if not rows:
+        logging.info("Vehicle-positions parse yielded 0 rows (unusual — check feed)")
+        return 0
+    try:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO realtime_vehicle_positions
+                (timestamp, route_id, trip_id, stop_id, latitude, longitude,
+                 bus_id, vehicle_label)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            rows,
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        logging.error("Vehicle-positions insert failed (non-fatal): %s", exc)
+        return 0
+    logging.info("Vehicle-positions: inserted/ignored %d rows", len(rows))
+    return len(rows)
+
+
 if __name__ == "__main__":
     logging.info("collect_realtime_v2 started")
     conn = sqlite3.connect(DB_REALTIME)
@@ -185,6 +285,17 @@ if __name__ == "__main__":
         _finish_run(conn, run_id, 0, 0, "error")
         logging.exception("Run failed: %s", exc)
         raise
+
+    # Vehicle-positions collection is INDEPENDENT of the trip-updates path above.
+    # It runs after the primary run has been committed and marked 'ok', and its
+    # exceptions are swallowed at the function boundary — so a broken vehicle
+    # feed can never mark the whole collection run as errored. The tradeoff:
+    # vehicle-position failures are silent to `collection_runs.status` but
+    # visible in logs.
+    try:
+        collect_vehicle_positions(conn)
+    except Exception as exc:
+        logging.exception("Vehicle-positions collection swallowed exception: %s", exc)
     finally:
         conn.close()
     logging.info("collect_realtime_v2 finished")
