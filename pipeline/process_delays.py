@@ -33,7 +33,36 @@ logging.basicConfig(
 
 # SQLite syntax: LAG over trip ordered by stop_sequence gives previous stop's delay.
 # ATTACH lets us join across the two databases in a single query.
+#
+# 2026-07-08 defensive rewrite — LAG on stop_delays alone, THEN join.
+# The v1 query computed LAG over the JOINed result. A pipeline audit flagged
+# this as potentially unsafe (branching / loop topology could duplicate rows
+# per (trip_id, stop_id, stop_sequence) and let LAG's "previous row" be the
+# JOIN-duplicated CURRENT row). Empirical test on the heaviest-branching route
+# (12940 on 2026-06-24) showed v1 and v2 produce IDENTICAL previous_stop_delay
+# — the JOIN key includes stop_sequence, which idx_st_trip_stop_seq makes
+# unique per (trip, stop, seq), so no duplicates arise in practice.
+# Splitting into a CTE anyway because it (a) makes the intent explicit
+# (LAG operates on stop_delays' primary key), and (b) is robust if the JOIN
+# key is ever relaxed. Same output today, safer under future change.
 _QUERY = """
+WITH sd_with_lag AS (
+    SELECT
+        trip_id,
+        route_id,
+        stop_id,
+        stop_sequence,
+        delay_seconds,
+        bus_id,
+        timestamp,
+        service_date,
+        LAG(delay_seconds) OVER (
+            PARTITION BY trip_id, service_date
+            ORDER BY stop_sequence, actual_arrival
+        ) AS previous_stop_delay
+    FROM main.stop_delays
+    {where}
+)
 SELECT
     sd.trip_id,
     sd.route_id,
@@ -43,22 +72,18 @@ SELECT
     sd.bus_id,
     sd.timestamp,
     sd.service_date,
-    LAG(sd.delay_seconds) OVER (
-        PARTITION BY sd.trip_id, sd.service_date
-        ORDER BY sd.stop_sequence, sd.actual_arrival
-    )                              AS previous_stop_delay,
+    sd.previous_stop_delay,
     st.shape_dist_traveled,
     t.direction_id,
     s.stop_lat,
     s.stop_lon
-FROM main.stop_delays sd
+FROM sd_with_lag sd
 LEFT JOIN static_db.stop_times st
        ON sd.trip_id       = st.trip_id
       AND sd.stop_id        = st.stop_id
       AND sd.stop_sequence  = st.stop_sequence
 LEFT JOIN static_db.trips t  ON sd.trip_id = t.trip_id
 LEFT JOIN static_db.stops s  ON sd.stop_id  = s.stop_id
-{where}
 ORDER BY sd.trip_id, sd.service_date, sd.stop_sequence
 """
 

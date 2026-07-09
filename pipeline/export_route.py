@@ -25,6 +25,10 @@ _COLS = [
     "stop_lat", "stop_lon", "delay_seconds", "previous_stop_delay",
     "shape_dist_traveled", "hour", "dow", "is_rush_hour", "is_weekend",
     "timestamp",
+    # service_date added 2026-07-08 so R consumers can filter/group on the
+    # authoritative Vancouver-tz date instead of re-deriving it from timestamp
+    # (which historically silently used the R session tz — audit fix).
+    "service_date",
 ]
 
 

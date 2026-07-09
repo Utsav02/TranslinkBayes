@@ -42,10 +42,22 @@ check_hash "$TEST"  "loop_test.parquet"
 echo "[ok] frozen split hashes verified against manifest"
 
 # ── 2. Resolve next un-run candidate ─────────────────────────────────────────
+# A candidate is "done" iff its saved-model filename `brms_<ID>.rds` appears in
+# the model_file column of run_log.csv. v1 used a bare `grep -q "$id"` which
+# substring-matched inside longer ids (e.g. C0 collided with C0_notrip, C0_nu4,
+# "(C0 repro refit …)"), silently skipping candidates. v2 (2026-07-08) matches
+# the exact `brms_<ID>.rds` string — every candidate script (see run_tracker.R
+# usage in loop_eval.R) writes model_file in that form, so this is unambiguous
+# and never collides across ids (the trailing `.rds` breaks any prefix overlap).
 next_id=""; next_script=""
+is_done() {
+  local target="$1"
+  # Fixed-string search, anchored by the `brms_` prefix and `.rds` suffix.
+  grep -qF "brms_${target}.rds" "$RUNLOG" 2>/dev/null
+}
 while IFS=$'\t' read -r id script _; do
   [[ "$id" =~ ^#|^$ ]] && continue
-  if grep -q "$id" "$RUNLOG" 2>/dev/null; then continue; fi   # already has a run_log row
+  if is_done "$id"; then continue; fi
   next_id="$id"; next_script="$script"; break
 done < "$CAND"
 

@@ -16,7 +16,9 @@ raw <- arrow::read_parquet(PARQUET) |>
   filter(route_id != "", !is.na(delay_seconds), !is.na(previous_stop_delay),
          !is.na(shape_dist_traveled), !is.na(hour), !is.na(stop_id), !is.na(trip_id),
          abs(delay_seconds) <= 3600, abs(previous_stop_delay) <= 3600) |>
-  mutate(timestamp = as.POSIXct(timestamp, tz = "UTC"), date = as.Date(timestamp),
+  mutate(timestamp = as.POSIXct(timestamp, tz = "UTC"),
+         # `date` in Vancouver TZ to match Python pipeline's service_date (audit 2026-07-08)
+         date = as.Date(format(timestamp, "%Y-%m-%d", tz = "America/Vancouver")),
          hour = as.integer(hour), dow = as.integer(wday(timestamp, week_start = 1L)),
          trip_id = as.character(trip_id), stop_id = as.character(stop_id),
          route_id = as.character(route_id))

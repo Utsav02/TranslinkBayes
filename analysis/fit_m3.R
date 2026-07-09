@@ -28,7 +28,12 @@ raw <- arrow::read_parquet(pq_path) |>
   ) |>
   mutate(
     timestamp = as.POSIXct(timestamp, tz = "UTC"),
-    date      = as.Date(timestamp),
+    # `date` = Vancouver local date (matches processed_stops.service_date, which
+    # is Pacific-tz derived). Prior code used as.Date(timestamp) with no tz arg,
+    # which used the R session's default TZ — silently disagreed with the
+    # Python pipeline's Vancouver-tz service_date (audit 2026-07-08). Explicit
+    # tz coercion keeps the anomaly-day rule aligned with materialize_loop_split.
+    date      = as.Date(format(timestamp, "%Y-%m-%d", tz = "America/Vancouver")),
     hour      = as.integer(hour),
     dow       = as.integer(wday(timestamp, week_start = 1L)),
     trip_id   = as.character(trip_id),

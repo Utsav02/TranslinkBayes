@@ -1,4 +1,4 @@
-# Cloud Loop Runbook — running the 10-candidate model-search loop on a cloud box
+# Cloud Loop Runbook — running the 8-candidate model-search loop on a cloud box
 
 This 16 GB laptop has failed the workload too many times to host the actual
 loop: two system-sleep deaths, two 16 GB eval OOMs (one on `posterior_predict`,
@@ -158,8 +158,11 @@ rather than re-materialize. The frozen split is never regenerated on cloud.
 **Cloud (this loop):**
 - One iteration at a time: author `analysis/fit_candidate_<ID>.R` from the
   template, fit, evaluate on the frozen TEST, append the `run_log.csv` row.
-- All ten candidates C0–C7 (the queue) plus the already-completed C0_notrip /
+- The 8 active candidates in `analysis/loop_candidates.tsv` (queue v2, order:
+  C7, C2, C5, C3, C4, C1, C9, C8) plus the already-completed C0_notrip /
   C0_nu4 / C_m2nu4 rows (which arrive in `run_log.csv` from the laptop).
+- Note: v1 candidates **C0 and C6 are DROPPED** (documented inline in
+  `loop_candidates.tsv` with rationale). Do not re-add them.
 
 **Laptop only (do not move):**
 - The live collector and `com.translink.sync-static` launchd jobs (these write

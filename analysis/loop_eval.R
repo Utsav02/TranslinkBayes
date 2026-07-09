@@ -48,14 +48,25 @@ eval_and_log <- function(fit, candidate_id, train, test,
   elpd_tot <- sum(elpd_pw); elpd_se <- sd(elpd_pw) * sqrt(length(elpd_pw))
   cat(sprintf("%s held-out ELPD=%.1f (SE %.1f) over %d rows\n",
               candidate_id, elpd_tot, elpd_se, length(elpd_pw)))
-  base <- "../exports/elpd_pointwise_C0.rds"
-  if (file.exists(base) && candidate_id != "C0") {
+  # ΔELPD vs the accepted REFERENCE baseline (docs/baseline_registry.md §2.1).
+  # v1 hardcoded "C0" which was never fit; v2 (2026-07-08) points at C_m2nu4,
+  # the reference of record. The candidate skips the compare if it IS the ref.
+  REF_ID   <- "C_m2nu4"
+  base     <- sprintf("../exports/elpd_pointwise_%s.rds", REF_ID)
+  if (file.exists(base) && candidate_id != REF_ID) {
     pb <- readRDS(base)
     if (length(pb) == length(elpd_pw)) {
       d <- elpd_pw - pb
-      cat(sprintf("  ΔELPD vs C0 = %.1f (SE %.1f)  [paired pointwise]\n",
-                  sum(d), sd(d) * sqrt(length(d))))
+      delpd <- sum(d); delpd_se <- sd(d) * sqrt(length(d))
+      pass  <- delpd > 2 * delpd_se
+      cat(sprintf("  ΔELPD vs %s = %.1f (SE %.1f)  [paired pointwise]  %s\n",
+                  REF_ID, delpd, delpd_se, if (pass) "PASS G4 (>2×SE)" else "FAIL G4"))
+    } else {
+      cat(sprintf("  WARN: reference elpd_pointwise_%s.rds length %d != candidate length %d — skipping ΔELPD\n",
+                  REF_ID, length(pb), length(elpd_pw)))
     }
+  } else if (!file.exists(base)) {
+    cat(sprintf("  WARN: reference baseline %s missing at %s — ΔELPD not computed\n", REF_ID, base))
   }
 
   results <- test |> mutate(pred = mu, residual = delay_seconds - mu, covered = cov)
