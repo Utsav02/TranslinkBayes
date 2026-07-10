@@ -376,6 +376,54 @@ def run(since: str | None = None) -> int:
     else:
         rpt.ok(f"All {trip_total:,} trips have strictly increasing stop_sequence within each service_date")
 
+    # ── 8. Processed-stops boundary integrity ────────────────────────────────
+    # Added 2026-07-09 after the silent-loss episode: process_delays.py --since X
+    # processes only what exists in stop_delays AT RUN TIME. When --since X is
+    # run while service_date=X's collection is still in progress, that day's
+    # rows get partially processed and never refreshed by a later --since Y>X
+    # (which only DELETEs service_date>=Y). We saw this bite Jun 13 (24% of raw
+    # rows preserved) and Jun 25 (0.03%) before Fix 1 on 2026-07-08. This check
+    # flags any service_date where processed_stops rows < 90% of stop_delays
+    # rows — catches the same failure mode going forward.
+    rpt.section("8. PROCESSED_STOPS BOUNDARY INTEGRITY")
+    from datetime import timedelta as _td   # local import — used only here
+
+    # For every service_date with ≥1000 rows in stop_delays and (if --since was
+    # passed) within the window, compare processed_stops row count to raw. Any
+    # discrepancy > 10% flags a boundary-date silent-loss victim. Today's date
+    # is excluded because collection is by definition still in progress. This
+    # filter is on service_date (Pacific), so we exclude LOCAL today. The
+    # 'stop_delays.timestamp' filter isn't useful here (a row's timestamp is
+    # its LAST upsert time, not the service_date).
+    since_pred = f"AND service_date >= '{since}'" if since else ""
+    boundary_bad = conn.execute(f"""
+        SELECT sd.service_date, sd.n_sd, COALESCE(ps.n_ps, 0) AS n_ps
+        FROM (SELECT service_date, COUNT(*) AS n_sd FROM stop_delays
+              WHERE 1=1 {since_pred}
+              GROUP BY service_date) sd
+        LEFT JOIN (SELECT service_date, COUNT(*) AS n_ps FROM processed_stops
+                   WHERE 1=1 {since_pred}
+                   GROUP BY service_date) ps
+          ON sd.service_date = ps.service_date
+        WHERE sd.n_sd >= 1000
+          AND (COALESCE(ps.n_ps, 0) * 1.0 / sd.n_sd) < 0.90
+          AND sd.service_date < date('now', 'localtime')
+        ORDER BY sd.service_date
+    """).fetchall()
+
+    if not boundary_bad:
+        rpt.ok("All complete-day service_dates have processed_stops ≥ 90% of stop_delays")
+    else:
+        for row in boundary_bad:
+            d, n_sd, n_ps = row["service_date"], row["n_sd"], row["n_ps"]
+            pct = 100 * n_ps / n_sd
+            next_d = (date.fromisoformat(d) + _td(days=1)).isoformat()
+            rpt.warn(
+                f"{d}: processed_stops has {n_ps:,} rows / stop_delays {n_sd:,} "
+                f"({pct:.1f}%). Re-run: "
+                f"venv/bin/python3 pipeline/process_delays.py --since {d} --until {next_d}"
+            )
+
     # ── Summary ───────────────────────────────────────────────────────────────
     rpt.section("SUMMARY")
     rpt.line(f"  Hard failures: {len(rpt.hard_failures)}")

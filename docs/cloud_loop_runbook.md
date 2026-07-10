@@ -1,4 +1,4 @@
-# Cloud Loop Runbook — running the 8-candidate model-search loop on a cloud box
+# Cloud Loop Runbook — running the 9-candidate model-search loop on a cloud box
 
 This 16 GB laptop has failed the workload too many times to host the actual
 loop: two system-sleep deaths, two 16 GB eval OOMs (one on `posterior_predict`,
@@ -44,19 +44,24 @@ exactly the trade preemptibles are designed for. Use:
 - GCP Spot `n2-standard-8` (~$0.07/h)
 - Hetzner CX52 (not preemptible, but $0.04/h on demand — even cheaper).
 
-### Queue size and compute estimate (v2 queue, 2026-06-16)
+### Queue size and compute estimate (v2 queue, updated 2026-07-09)
 
-`analysis/loop_candidates.tsv` (reconciled) has **8 active candidates** to fit
-on cloud (C7, C2, C5, C3, C4, C1, C9, C8). The three completed laptop fits
-(C0_notrip, C0_nu4, C_m2nu4) are already in `run_log.csv` and skipped. Two
-v1 candidates were dropped with documented evidence (C0, C6).
+`analysis/loop_candidates.tsv` (reconciled) has **9 active candidates** to fit
+on cloud (order: C_fifa, C7, C2, C5, C3, C4, C1, C9, C8). The three completed
+laptop fits (C0_notrip, C0_nu4, C_m2nu4) are already in `run_log.csv` and
+skipped. Two v1 candidates were dropped with documented evidence (C0, C6).
+
+**Front of queue is C_fifa** — pre-registered 2026-07-09 from the dow-hour-
+matched empirical analysis; highest scientific value candidate in the queue
+(quantifies the observed +87–276 s per-match delay premium on affected routes
+via a match-day × affected-route × hour-from-kickoff interaction).
 
 Per-candidate cloud wall-time, calibrated against C_m2nu4 (laptop, 4-core,
 ~2h) scaled to 8-vCPU / 32 GB cloud:
 
 | Candidates | Per-fit wall (cloud) | Per-fit cost (spot) |
 |---|---|---|
-| C7, C2, C5, C3, C4, C1, C9 (7 standard fits) | ~1.5–2.5 h each | ~$0.10–$0.20 each |
+| C_fifa, C7, C2, C5, C3, C4, C1, C9 (8 standard fits) | ~1.5–2.5 h each | ~$0.10–$0.20 each |
 | C8 (75k-row scale-up) | ~6–8 h | ~$0.50–$0.65 |
 | **Total compute** | **~16–25 h** | **~$2–$4 raw fit cost** |
 
@@ -158,9 +163,10 @@ rather than re-materialize. The frozen split is never regenerated on cloud.
 **Cloud (this loop):**
 - One iteration at a time: author `analysis/fit_candidate_<ID>.R` from the
   template, fit, evaluate on the frozen TEST, append the `run_log.csv` row.
-- The 8 active candidates in `analysis/loop_candidates.tsv` (queue v2, order:
-  C7, C2, C5, C3, C4, C1, C9, C8) plus the already-completed C0_notrip /
-  C0_nu4 / C_m2nu4 rows (which arrive in `run_log.csv` from the laptop).
+- The 9 active candidates in `analysis/loop_candidates.tsv` (queue v2, order:
+  **C_fifa**, C7, C2, C5, C3, C4, C1, C9, C8) plus the already-completed
+  C0_notrip / C0_nu4 / C_m2nu4 rows (which arrive in `run_log.csv` from the
+  laptop).
 - Note: v1 candidates **C0 and C6 are DROPPED** (documented inline in
   `loop_candidates.tsv` with rationale). Do not re-add them.
 

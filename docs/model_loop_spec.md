@@ -256,14 +256,15 @@ set). Only the REFERENCE gets the relaxed gate (registry §2.1).
 
 | Order | ID | Change vs C_m2nu4 base | Hypothesis | Convergence risk | Data prep |
 |---|---|---|---|---|---|
-| 1 | **C7** | + `precip_mm + temp_c` | weather adds signal beyond schedule features | low (2 continuous FE) | join `weather_hourly.parquet` on Pacific (date, hour) — fetcher in `pipeline/fetch_weather_eccc.py` |
-| 2 | **C2** | + `log(headway_obs / headway_sched)` | bunching amplifies delay beyond carry-forward | low (1 continuous FE) | derive headway via SQL window over `stop_delays`, persist in TRAIN/TEST |
-| 3 | **C5** | `(1|route_id)` → `(1 + previous_stop_delay | route_id)` | propagation strength varies by route (express vs local) | **acceptable** — 25 route groups, NOT high-cardinality; this is the "structure without funneling" template that replaces the dropped trip/stop REs | none |
-| 4 | **C3** | + `timepoint * previous_stop_delay` | propagation resets at scheduled timepoints (slope < off-timepoint) | low (1 interaction) | join `timepoint` from static `stop_times` |
-| 5 | **C4** | `shape_dist_traveled` → `s(shape_dist_traveled, bs="tp", k=8)` | non-linear delay accumulation along route (recovery padding) | low (smooth, no RE) | none |
-| 6 | **C1** | TRAIN filtered to settled rows (`actual_arrival ≤ timestamp`) | **VALIDITY PROBE** — does b_prev fall well below 1 once the response is observation-grade not predicted? | low (no formula change) | settled flag (tier-b); subset shrinks TRAIN to ~5.9% — note in run_log |
-| 7 | **C9** | `bf(..., sigma ~ is_rush_hour + s(hour, bs="cc", k=8))` | residual scale is time-varying — gains in cov90/ELPD, not RMSE | medium (smooth on σ scale) | none |
-| 8 | **C8** | scale-up: top-50 routes × 1,500 rows (~75k TRAIN) | does more data identify what 25×500 cannot (tighter posteriors)? | structure unchanged; **expensive** (~6–8 h cloud) | none |
+| 1 | **C_fifa** | + `is_match_day * is_affected_route * s(hour_from_kickoff, bs="cs", k=6)` | model recovers the empirically-observed FIFA-day delay premium on affected routes with a tight CI | low (all FE, no new REs) | derive `is_match_day`, `is_affected_route` (route in {014,019,023,028,130,222}), `hour_from_kickoff` (∞ for non-match days) from static tables + the fixed 7-date match schedule (§1.6 known_baseline) |
+| 2 | **C7** | + `precip_mm + temp_c` | weather adds signal beyond schedule features | low (2 continuous FE) | join `weather_hourly.parquet` on Pacific (date, hour) — fetcher in `pipeline/fetch_weather_eccc.py`. **CAVEAT: temp_c is 100% missing 2026-06-13 → 06-30 (station outage at Vancouver Harbour CS); fitting requires either dropping those service_dates or acquiring YVR (51442) as fallback.** |
+| 3 | **C2** | + `log(headway_obs / headway_sched)` | bunching amplifies delay beyond carry-forward | low (1 continuous FE) | derive headway via SQL window over `stop_delays`, persist in TRAIN/TEST |
+| 4 | **C5** | `(1|route_id)` → `(1 + previous_stop_delay | route_id)` | propagation strength varies by route (express vs local) | **acceptable** — 25 route groups, NOT high-cardinality; this is the "structure without funneling" template that replaces the dropped trip/stop REs | none |
+| 5 | **C3** | + `timepoint * previous_stop_delay` | propagation resets at scheduled timepoints (slope < off-timepoint) | low (1 interaction) | join `timepoint` from static `stop_times` |
+| 6 | **C4** | `shape_dist_traveled` → `s(shape_dist_traveled, bs="tp", k=8)` | non-linear delay accumulation along route (recovery padding) | low (smooth, no RE) | none |
+| 7 | **C1** | TRAIN filtered to settled rows (`actual_arrival ≤ timestamp` OR using `settledness_bucket ∈ {A,B,C}` from `stop_delays_settledness.parquet`) | **VALIDITY PROBE** — does b_prev fall well below 1 once the response is observation-grade not predicted? | low (no formula change) | settledness table (derived 2026-07-09); subset A+B+C ≈ 30% of rows — note in run_log |
+| 8 | **C9** | `bf(..., sigma ~ is_rush_hour + s(hour, bs="cc", k=8))` | residual scale is time-varying — gains in cov90/ELPD, not RMSE | medium (smooth on σ scale) | none |
+| 9 | **C8** | scale-up: top-50 routes × 1,500 rows (~75k TRAIN) | does more data identify what 25×500 cannot (tighter posteriors)? | structure unchanged; **expensive** (~6–8 h cloud) | none |
 
 The machine-readable order is `analysis/loop_candidates.tsv`. Order is
 deliberate: **front-load** the cheapest and highest-hypothesis-value

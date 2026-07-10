@@ -137,11 +137,14 @@ def process(since: str | None = None, until: str | None = None, full: bool = Fal
 
     clauses = []
     params: list[str] = []
+    # NB: no `sd.` alias here — the WHERE goes inside the CTE where the FROM is
+    # `main.stop_delays` directly (Fix 4 rewrite 2026-07-08). Adding a table
+    # alias in the WHERE would fail with "no such column: sd.service_date".
     if since:
-        clauses.append("sd.service_date >= ?")
+        clauses.append("service_date >= ?")
         params.append(since)
     if until:
-        clauses.append("sd.service_date < ?")
+        clauses.append("service_date < ?")
         params.append(until)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
