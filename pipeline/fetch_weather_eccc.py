@@ -127,7 +127,8 @@ def _to_pacific_keys(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fetch(station_id: int, since: date, until: date, dry_run: bool) -> pd.DataFrame:
+def fetch(station_id: int, since: date, until: date, dry_run: bool,
+          output: "Path | None" = None) -> pd.DataFrame:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     frames = []
     verified = False
@@ -173,22 +174,27 @@ def fetch(station_id: int, since: date, until: date, dry_run: bool) -> pd.DataFr
               f"precip_mm>0 hours: {(out.get('precip_mm', pd.Series()).gt(0)).sum()}")
         return out
 
-    OUT_PATH.parent.mkdir(exist_ok=True)
-    out.to_parquet(OUT_PATH, index=False)
-    print(f"Wrote {len(out):,} hourly rows → {OUT_PATH}")
+    out_path = output if output is not None else OUT_PATH
+    out_path.parent.mkdir(exist_ok=True)
+    out.to_parquet(out_path, index=False)
+    print(f"Wrote {len(out):,} hourly rows → {out_path}")
     print(f"  range: {out['service_date'].min()} .. {out['service_date'].max()}")
     return out
 
 
 if __name__ == "__main__":
+    from pathlib import Path
     p = argparse.ArgumentParser(description="Fetch ECCC hourly weather → parquet")
     p.add_argument("--station", type=int, default=DEFAULT_STATION_ID,
                    help=f"ECCC internal stationID (default {DEFAULT_STATION_ID} = Vancouver Harbour CS)")
     p.add_argument("--since", required=True, help="ISO date lower bound (inclusive)")
     p.add_argument("--until", help="ISO date upper bound (inclusive); default = today")
     p.add_argument("--dry-run", action="store_true", help="parse + print, do not write parquet")
+    p.add_argument("--output", type=Path, default=None,
+                   help="Override output parquet path (default: exports/weather_hourly.parquet). "
+                        "Use to fetch a fallback station (e.g. YVR 51442) into a separate file.")
     args = p.parse_args()
 
     since = date.fromisoformat(args.since)
     until = date.fromisoformat(args.until) if args.until else datetime.now(LST_TZ).date()
-    fetch(args.station, since, until, args.dry_run)
+    fetch(args.station, since, until, args.dry_run, args.output)
