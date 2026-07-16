@@ -46,6 +46,7 @@ unseen-route evaluation).
 | 2026-06-14 | C0_notrip (m3 − trip RE) | 12,500 (25 rt) | 1.0008 [0.9999, 1.0017] | 8.68 | 2.00 | 1.0280 | 147 | 42 | 35.48 | 91.33 | 0.803 |
 | 2026-06-16 | C0_nu4 (m3, nu fixed=4) | 12,500 (25 rt) | 1.0001 [0.9987, 1.0015] | 15.45 | 4.0 | 1.0114 | 418 | 25 | 35.44 | 91.07 | 0.830 |
 | **2026-06-16** | **C_m2nu4 (REFERENCE — see §2.1)** | 12,500 (25 rt) | 0.9987 [0.9966, 1.0008] | 26.07 | 4.0 | **1.0043** | **703** | **29** | 36.69 | 91.85 | **0.8465** |
+| 2026-07-11 | C0_notrip_99 (m3 − trip RE, adapt_delta=0.99) | 12,500 (25 rt) | 1.0008 [0.9999, 1.0017] | 8.69 | 2.00 | **1.0356** | **105** | **5** | 35.49 | 91.33 | 0.803 |
 
 ### §2.1 — REFERENCE selected (relaxed gate, documented): **C_m2nu4** (2026-06-16)
 
@@ -111,6 +112,70 @@ the reference of record** and the loop runs against it.
   pointwise ELPD at `exports/elpd_pointwise_C_m2nu4.rds`;
   saved fit at `analysis/models/brms_C_m2nu4.rds` (6.7 MB — yes, 100× smaller
   than the m3-class fits because we dropped the dense REs).
+
+### §2.2 — REFERENCE DECISION HELD: C0_notrip_99 fails, C_m2nu4 stays (2026-07-11)
+
+Reference-tension resolver (2026-07-11 row above): C0_notrip refit at
+`adapt_delta=0.99`. Same formula and priors as the original C0_notrip — the
+ONLY change was the sampler step-size adaptation. Ran ~18 h wall (`nohup` +
+`caffeinate -s`) as one final laptop fit.
+
+**Sampler-tuning is definitively insufficient.**
+
+| | m3 refit | C0_notrip @ 0.95 | **C0_notrip_99 @ 0.99** | Direction |
+|---|---|---|---|---|
+| R-hat max | 1.0356 | 1.0280 | **1.0356** | ← flat/worse |
+| Divergences | 9 | 42 | **5** | ← big improvement |
+| ESS min | 315 | 147 | **105** | ← worse |
+| ΔELPD vs C_m2nu4 | — | +3186 (SE 213) | **+3203 (SE 213), z=+15** | replicated |
+
+Adapt_delta 0.95 → 0.99 dramatically fixed divergences (42 → 5, well under
+the 1% relaxed bar) but **R-hat and ESS did not improve** — R-hat is flat at
+1.0356, ESS actually dropped to 105 (more careful step-size = less
+independent info per unit compute). That pattern means the residual issue is
+**structural**, not sampler-tuning: chains explore near-different posterior
+modes (bad mixing across chains), and each individual chain is inefficient
+within its own trajectory. `adapt_delta` cannot fix that. The full
+laptop-side sampler-tuning search is now exhausted.
+
+**Reference held: `C_m2nu4`** (§2.1). Decision made under `C0_notrip_99 gate:
+strict=FAIL relaxed=FAIL` printed by the fit script itself.
+
+**BUT — the ΔELPD result is a real and reproducible finding, and must be
+carried explicitly.** C0_notrip_99 predicts held-out data by z=+15 better
+than the accepted reference. The reason we don't adopt it as the reference:
+
+- Its `R-hat=1.0356` and `ESS=105` mean the posterior isn't reliably
+  characterized (chains aren't consistent with each other; effective sample
+  is tiny).
+- Any ΔELPD comparison *against* C0_notrip_99 would be against a target with
+  posterior-uncertainty artifacts, biasing the comparison in ways we can't
+  quantify.
+- Standing convention (Vehtari et al.; brms/loo docs): don't use an
+  unconverged fit as a reference in stacking / model selection.
+
+**Ceiling on what ΔELPD-vs-C_m2nu4 numbers actually mean.** Any candidate
+that shows ΔELPD < +3200 vs C_m2nu4 is doing WORSE than a fit we know exists
+in the design space (C0_notrip_99). Loop conclusions should be framed as
+"this candidate improves ΔELPD by X" not "this candidate is the best in the
+design space" — the latter has been falsified. C_m2nu4 is a *tractable*
+reference, not necessarily the best-predicting one.
+
+**What could still change this decision** (documented for the v2 loop):
+1. A future fit that both converges cleanly AND matches C0_notrip_99's ELPD.
+   The natural candidate is m3 minus trip RE with non-centered
+   parameterization (`(1 | route_id) + (1 | stop_id)` recoded to
+   `nc = TRUE`). Would need to be pre-registered and run on cloud.
+2. Enough training data that all three chains of C0_notrip's structure
+   naturally converge (the v2 dataset in July should have ~4× current train
+   size; worth retrying then).
+3. A hierarchical alternative to (1|stop_id) that trades stops for corridors
+   / spatial groupings — fewer levels, better geometry, similar coverage.
+
+— C0_notrip_99 decision recorded 2026-07-15; row 9 of `exports/run_log.csv`;
+  pointwise ELPD at `exports/elpd_pointwise_C0_notrip_99.rds`; saved fit
+  `analysis/models/brms_C0_notrip_99.rds` (132 MB) — kept in place as the
+  documented ELPD ceiling; **not** the reference.
 
 ### ⚠ 2026-06-13 genuine refit — FAILS the convergence gate (loop NO-GO)
 
